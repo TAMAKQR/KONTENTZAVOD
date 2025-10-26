@@ -8,7 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 
 from config import BOT_TOKEN
-from handlers import video_handler, animation_handler, photo_handler
+from handlers import video_handler, animation_handler, photo_handler, photo_ai_handler
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +23,7 @@ dp = Dispatcher(storage=storage)
 dp.include_router(video_handler.router)
 dp.include_router(animation_handler.router)
 dp.include_router(photo_handler.router)
+dp.include_router(photo_ai_handler.router)
 
 
 @dp.message(Command("start"))

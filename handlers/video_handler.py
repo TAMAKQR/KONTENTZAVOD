@@ -39,10 +39,16 @@ class VideoStates(StatesGroup):
     text_photo_editing_scene_photo = State()  # Загрузка нового фото для сцены
     
     # Подпоток 3: Текст + Фото + AI → Видео
-    text_photo_ai_choosing_model = State()
-    text_photo_ai_waiting_prompt = State()
-    text_photo_ai_waiting_photo = State()
-    text_photo_ai_generating = State()
+    text_photo_ai_choosing_model = State()  # Выбор модели (kling-v2.5-turbo-pro)
+    text_photo_ai_choosing_aspect_ratio = State()  # Выбор соотношения сторон
+    text_photo_ai_asking_reference = State()  # Вопрос о референсе
+    text_photo_ai_waiting_reference = State()  # Загрузка референса
+    text_photo_ai_waiting_prompt = State()  # Ввод промта
+    text_photo_ai_processing_prompt = State()  # GPT разбивает на сцены
+    text_photo_ai_generating_photos = State()  # Генерация фото через google/nano-banana
+    text_photo_ai_confirming_scenes = State()  # Подтверждение сцен с фото
+    text_photo_ai_editing_scene = State()  # Редактирование сцены
+    text_photo_ai_generating = State()  # Генерация видео
 
 
 @router.callback_query(lambda c: c.data == "video")
@@ -923,135 +929,5 @@ async def start_text_photo_video_generation(message: types.Message, state: FSMCo
     finally:
         await state.clear()
 
-
 # ==================== ПОДПОТОК 3: ТЕКСТ + ФОТО + AI → ВИДЕО ====================
-
-@router.callback_query(lambda c: c.data == "video_text_photo_ai")
-async def start_text_photo_ai_video(callback: types.CallbackQuery, state: FSMContext):
-    """Режим 3: Текст + Фото + AI - выбор модели AI"""
-    await callback.answer()
-    await state.set_state(VideoStates.text_photo_ai_choosing_model)
-    
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎬 Kling v2.5 Turbo Pro", callback_data="model_kling_ai")],
-            [InlineKeyboardButton(text="🎞️ Sora 2", callback_data="model_sora_ai")],
-            [InlineKeyboardButton(text="🎥 Veo 3.1 Fast", callback_data="model_veo_ai")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]
-        ]
-    )
-    
-    await callback.message.answer(
-        "📝🖼️🤖 Режим: Текст + Фото + AI → Видео\n\n"
-        "Выбери AI модель для генерации:",
-        reply_markup=keyboard
-    )
-
-
-@router.callback_query(lambda c: c.data.startswith("model_") and c.data.endswith("_ai"))
-async def choose_text_photo_ai_model(callback: types.CallbackQuery, state: FSMContext):
-    """Выбор модели для режима Текст+Фото+AI"""
-    await callback.answer()
-    
-    model_map = {
-        "model_kling_ai": "kwaivgi/kling-v2.5-turbo-pro",
-        "model_sora_ai": "openai/sora-2",
-        "model_veo_ai": "google/veo-3.1-fast"
-    }
-    
-    model = model_map.get(callback.data)
-    await state.update_data(model=model)
-    await state.set_state(VideoStates.text_photo_ai_waiting_prompt)
-    
-    model_name = callback.data.replace("model_", "").replace("_ai", "").upper()
-    
-    await callback.message.answer(
-        f"✅ Модель выбрана: {model_name}\n\n"
-        f"Напиши описание видео, которое ты хочешь создать:"
-    )
-
-
-@router.message(VideoStates.text_photo_ai_waiting_prompt)
-async def process_text_photo_ai_prompt(message: types.Message, state: FSMContext):
-    """Обработка промта для режима Текст+Фото+AI"""
-    await state.update_data(prompt=message.text)
-    await state.set_state(VideoStates.text_photo_ai_waiting_photo)
-    
-    await message.answer(
-        f"✅ Промт принят!\n\n"
-        f"📝 Описание: {message.text}\n\n"
-        f"Теперь загрузи фото, которое хочешь использовать в видео:"
-    )
-
-
-@router.message(VideoStates.text_photo_ai_waiting_photo)
-async def process_text_photo_ai_image(message: types.Message, state: FSMContext):
-    """Обработка фото для режима Текст+Фото+AI"""
-    if message.photo:
-        data = await state.get_data()
-        model = data.get("model", "kwaivgi/kling-v2.5-turbo-pro")
-        prompt = data.get("prompt", "")
-        
-        await state.set_state(VideoStates.text_photo_ai_generating)
-        
-        generating_msg = await message.answer(
-            f"🎬 Начинаю генерацию видео!\n\n"
-            f"📝 Промт: {prompt[:100]}...\n"
-            f"🎥 Модель: {model}\n\n"
-            f"⏳ Генерирую видео..."
-        )
-        
-        try:
-            uploader = ImageUploader()
-            image_url = await uploader.process_telegram_photo(
-                message.bot,
-                message.photo[-1].file_id,
-                photo_name="ai_input"
-            )
-            
-            if not image_url:
-                await generating_msg.edit_text("❌ Ошибка при обработке фото")
-                await state.clear()
-                return
-            
-            generator = VideoGenerator()
-            stitcher = VideoStitcher()
-            
-            result = await generator.generate_scene(
-                prompt=prompt,
-                duration=8,
-                aspect_ratio="16:9",
-                model="kling",
-                start_image_url=image_url
-            )
-            
-            if result.get("status") == "success":
-                video_url = result.get("video_url")
-                
-                await generating_msg.edit_text("📥 Скачиваю видео...")
-                
-                video_path = await stitcher.download_video(video_url, "output_video.mp4")
-                
-                if video_path:
-                    await generating_msg.delete()
-                    await message.answer_video(
-                        types.FSInputFile(video_path),
-                        caption="✅ Видео готово!"
-                    )
-                    
-                    await stitcher.cleanup_temp_files()
-                    logger.info("✅ Видео отправлено!")
-                else:
-                    await generating_msg.edit_text("❌ Ошибка при скачивании видео")
-            else:
-                error = result.get("error", "Unknown error")
-                await generating_msg.edit_text(f"❌ Ошибка генерации: {error}")
-                
-        except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
-            await generating_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
-        
-        finally:
-            await state.clear()
-    else:
-        await message.answer("❌ Отправь фото для видео")
+# Обработчики находятся в photo_ai_handler.py
