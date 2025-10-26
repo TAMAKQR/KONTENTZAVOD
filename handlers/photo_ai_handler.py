@@ -5,7 +5,7 @@ import logging
 from aiogram import Router, types, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import StateFilter
 from video_generator import VideoGenerator
 from photo_generator import PhotoGenerator
@@ -206,8 +206,9 @@ async def process_reference_image(message: types.Message, state: FSMContext):
 
 @router.message(PhotoAIStates.waiting_prompt)
 async def process_prompt(message: types.Message, state: FSMContext):
-    """Обработка промта и разбиение на сцены"""
+    """Обработка промта и разбиение на сцены + СРАЗУ ГЕНЕРИРУЕМ ВСЕ ФОТО ПАРАЛЛЕЛЬНО (БЕЗ ПОДТВЕРЖДЕНИЯ СЦЕН)"""
     data = await state.get_data()
+    reference_file_id = data.get("reference_file_id")
     
     await state.update_data(prompt=message.text)
     await state.set_state(PhotoAIStates.processing_prompt)
@@ -223,37 +224,199 @@ async def process_prompt(message: types.Message, state: FSMContext):
         f"{'─' * 40}\n\n"
         f"📝 Ваш промт:\n\n{indented_input}\n\n"
         f"{'─' * 40}\n"
-        f"🤖 Разбиваю на {num_scenes} сцены (5 сек каждая)..."
+        f"🤖 Разбиваю на {num_scenes} сцены (5 сек каждая)...\n"
+        f"📸 Затем генерирую фото (параллель)..."
     )
     
     try:
         generator = VideoGenerator()
         
-        # GPT разбивает промт на сцены
+        # ✅ GPT разбивает промт на сцены
         scenes_result = await generator.enhance_prompt_with_gpt(
             prompt=message.text,
             num_scenes=num_scenes,
-            duration_per_scene=5  # Каждая сцена 5 секунд
+            duration_per_scene=5
         )
+        
+        scenes = scenes_result["scenes"]
+        
+        await processing_msg.edit_text(
+            f"⏳ Разбито на {len(scenes)} сцен ✅\n"
+            f"{'─' * 40}\n"
+            f"📸 Генерирую фото для всех сцен (параллель)...\n"
+            f"⏳ Это займет 30-60 сек..."
+        )
+        
+        # ✅ ШАГ 1: Генерируем ВСЕ ФОТО ПАРАЛЛЕЛЬНО
+        photo_gen = PhotoGenerator()
+        
+        # Получаем URL референса из state, если был загружен
+        reference_url = data.get("reference_url")
+        if reference_url:
+            logger.info(f"📸 Используем reference_url: {reference_url[:80]}...")
+        else:
+            logger.info(f"📸 Генерация без reference (режим: без референса)")
+        
+        photos_result = await photo_gen.generate_photos_for_scenes(
+            scenes=scenes,
+            aspect_ratio=data.get("aspect_ratio", "16:9"),
+            reference_image_url=reference_url,  # ✅ Передаём реальный URL референса
+            general_prompt=""
+        )
+        
+        # ✅ ШАГ 2: Используем сцены с уже прикрепленными фото
+        final_scenes_with_photos = photos_result.get("scenes_with_photos", [])
+        successful_photos = photos_result.get("successful_photos", 0)
+        total_scenes = photos_result.get("total_scenes", len(final_scenes_with_photos))
+        
+        # ⚠️ Если есть ошибки при генерации фото
+        if successful_photos < total_scenes:
+            failed_count = total_scenes - successful_photos
+            error_msg = (
+                f"⚠️ Удалось сгенерировать фото: {successful_photos}/{total_scenes}\n"
+                f"❌ Не удалось: {failed_count} сцены\n\n"
+                f"💡 Совет: Это часто происходит из-за фильтра безопасности API.\n"
+                f"📝 Попробуйте изменить промт:\n"
+                f"- Избегайте слов 'женщина', 'человек', 'портрет'\n"
+                f"- Используйте 'персонаж', 'существо', 'изображение'\n"
+                f"- Сделайте промт более абстрактным или фантастичным"
+            )
+            logger.warning(f"⚠️ {error_msg}")
         
         await state.update_data(
-            scenes=scenes_result["scenes"],
+            scenes=final_scenes_with_photos,
             enhanced_prompt=scenes_result["enhanced_prompt"],
-            current_scene_index=0
+            current_photo_index=0
         )
         
-        await state.set_state(PhotoAIStates.confirming_scenes)
-        
-        await show_scene_for_confirmation(message, state, 0)
+        # ✅ ШАГ 3: Показываем ВСЕ СЦЕНЫ + ВСЕ ФОТО для подтверждения
         await processing_msg.delete()
+        await state.set_state(PhotoAIStates.confirming_photos)
+        await show_all_scenes_and_photos_for_confirmation(message, state)
         
     except Exception as e:
         logger.error(f"❌ Ошибка обработки: {e}")
-        await processing_msg.edit_text(
-            f"❌ Ошибка при обработке: {str(e)}\n\n"
-            f"Попробуй еще раз с /start"
-        )
+        error_text = str(e)
+        
+        # ✅ Специальная обработка ошибки E005 (фильтр безопасности)
+        if "E005" in error_text or "sensitive" in error_text.lower():
+            help_text = (
+                f"❌ Ошибка: Фильтр безопасности API\n\n"
+                f"Причина: Промт содержит слова о реальных людях\n\n"
+                f"💡 Совет для исправления:\n"
+                f"✏️ Избегайте:\n"
+                f"  - 'женщина', 'человек', 'люди', 'лицо'\n"
+                f"  - 'портрет', 'реальное фото'\n\n"
+                f"✅ Используйте:\n"
+                f"  - 'персонаж', 'существо', 'изображение'\n"
+                f"  - Более абстрактные описания\n"
+                f"  - Фантастические или художественные стили\n\n"
+                f"🔄 Введи новый промт с /start"
+            )
+        else:
+            help_text = f"❌ Ошибка при обработке:\n{error_text[:200]}\n\nПопробуй еще раз с /start"
+        
+        await processing_msg.edit_text(help_text)
         await state.clear()
+
+
+async def show_all_scenes_and_photos_for_confirmation(message: types.Message, state: FSMContext):
+    """✅ НОВОЕ: Показывает КАЖДУЮ СЦЕНУ + её ФОТО вместе для подтверждения"""
+    data = await state.get_data()
+    scenes = data.get("scenes", [])
+    
+    if not scenes:
+        await message.answer("❌ Ошибка: нет сцен")
+        return
+    
+    # Подсчитываем успешные фото
+    successful_photos_count = sum(1 for s in scenes if s.get("photo_url") or s.get("photo_path"))
+    failed_photos_count = len(scenes) - successful_photos_count
+    
+    # Показываем каждую сцену вместе с её фотографией
+    for i, scene in enumerate(scenes, 1):
+        # Формируем текст для этой сцены
+        scene_text = f"🎬 СЦЕНА {i} из {len(scenes)}\n"
+        scene_text += "─" * 40 + "\n"
+        scene_text += f"📝 Промт: {scene.get('prompt', 'N/A')}\n"
+        scene_text += f"⏱️ Длительность: {scene.get('duration', 5)} сек\n"
+        scene_text += f"🎨 Атмосфера: {scene.get('atmosphere', 'N/A')}"
+        
+        # Добавляем информацию об ошибке, если есть
+        if scene.get("photo_error"):
+            scene_text += f"\n❌ Ошибка: {scene.get('photo_error')[:100]}"
+        
+        # Отправляем информацию сцены
+        await message.answer(scene_text, parse_mode="Markdown")
+        
+        # Отправляем фотографию для этой сцены (если она есть)
+        photo_path = scene.get("photo_path")
+        photo_url = scene.get("photo_url")
+        
+        if photo_path or photo_url:
+            try:
+                if photo_path:
+                    # ✅ Используем FSInputFile для локальных файлов
+                    photo_input = FSInputFile(photo_path)
+                    await message.answer_photo(
+                        photo=photo_input,
+                        caption=f"🖼️ Фото для сцены {i} ✅"
+                    )
+                elif photo_url:
+                    await message.answer_photo(
+                        photo=photo_url,
+                        caption=f"🖼️ Фото для сцены {i} ✅"
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ Не смог отправить фото сцены {i}: {e}")
+                await message.answer(f"⚠️ Ошибка при отправке фото сцены {i}: {str(e)[:80]}")
+        else:
+            await message.answer(
+                f"❌ Фото для сцены {i} не найдено\n\n"
+                f"Причина: {scene.get('photo_error', 'Ошибка генерации')}"
+            )
+    
+    # В конце показываем финальное сообщение с кнопками подтверждения
+    final_text = "=" * 50 + "\n"
+    
+    if failed_photos_count == 0:
+        final_text += f"✅ ВСЕ {len(scenes)} СЦЕН И ИХ ФОТО ГОТОВЫ!\n"
+    else:
+        final_text += f"⚠️ СТАТУС: {successful_photos_count}/{len(scenes)} фото готовы\n"
+        final_text += f"❌ Не удалось: {failed_photos_count} сцены\n"
+    
+    final_text += "=" * 50 + "\n\n"
+    final_text += "Подтверждаешь ли все сцены и фото для генерации видео?"
+    
+    # Кнопки зависят от того, есть ли ошибки
+    if failed_photos_count > 0:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ ПРИНЯТЬ (даже с ошибками)", callback_data="photo_ai_confirm_all_scenes"),
+                    InlineKeyboardButton(text="🔄 Переделать ВСЕ", callback_data="photo_ai_regenerate_photos")
+                ],
+                [
+                    InlineKeyboardButton(text="✏️ Изменить промт", callback_data="photo_ai_edit_all_scenes"),
+                    InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")
+                ]
+            ]
+        )
+    else:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ ПРИНЯТЬ ВСЕ", callback_data="photo_ai_confirm_all_scenes"),
+                    InlineKeyboardButton(text="✏️ Редактировать сцены", callback_data="photo_ai_edit_all_scenes")
+                ],
+                [
+                    InlineKeyboardButton(text="🔄 Переделать фото", callback_data="photo_ai_regenerate_photos"),
+                    InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")
+                ]
+            ]
+        )
+    
+    await message.answer(final_text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 async def show_scene_for_confirmation(message: types.Message, state: FSMContext, scene_index: int):
@@ -294,6 +457,108 @@ async def show_scene_for_confirmation(message: types.Message, state: FSMContext,
     )
     
     await message.answer(scene_text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+@router.callback_query(lambda c: c.data == "photo_ai_confirm_all_scenes")
+async def confirm_all_scenes(callback: types.CallbackQuery, state: FSMContext):
+    """✅ НОВОЕ: Подтверждение ВСЕ СЦЕНЫ + ФОТО → Генерация видео"""
+    await callback.answer()
+    
+    data = await state.get_data()
+    scenes = data.get("scenes", [])
+    
+    # Переименовываем для совместимости с start_video_generation_final()
+    await state.update_data(scenes_with_photos=scenes)
+    
+    await callback.message.answer(
+        f"⏳ Начинаю генерацию видео для {len(scenes)} сцен...\n"
+        f"🎬 Это займет 2-5 минут в зависимости от количества сцен"
+    )
+    
+    # Переходим к генерации видео
+    await start_video_generation_final(callback.message, state)
+
+
+@router.callback_query(lambda c: c.data == "photo_ai_regenerate_photos")
+async def regenerate_all_photos(callback: types.CallbackQuery, state: FSMContext):
+    """🔄 Переделать все фото - вернуться к шагу генерации фото"""
+    await callback.answer()
+    
+    data = await state.get_data()
+    scenes = data.get("scenes", [])
+    aspect_ratio = data.get("aspect_ratio", "16:9")
+    
+    processing_msg = await callback.message.answer(
+        f"🔄 Переделаю фото для всех {len(scenes)} сцен...\n"
+        f"⏳ Это займет 30-60 сек..."
+    )
+    
+    # Переходим обратно к генерации фото
+    await state.set_state(PhotoAIStates.processing_prompt)
+    
+    try:
+        photo_gen = PhotoGenerator()
+        
+        # ✅ Используем новый API с правильными параметрами
+        photos_result = await photo_gen.generate_photos_for_scenes(
+            scenes=scenes,
+            aspect_ratio=aspect_ratio,
+            reference_image_url=None,
+            general_prompt=""
+        )
+        
+        # ✅ Используем сцены с уже прикрепленными фото
+        final_scenes_with_photos = photos_result.get("scenes_with_photos", [])
+        successful_photos = photos_result.get("successful_photos", 0)
+        total_scenes = photos_result.get("total_scenes", len(final_scenes_with_photos))
+        
+        # ⚠️ Если есть ошибки при генерации фото
+        if successful_photos < total_scenes:
+            failed_count = total_scenes - successful_photos
+            logger.warning(
+                f"⚠️ Переделка фото: {successful_photos}/{total_scenes} успешно, "
+                f"{failed_count} ошибок"
+            )
+        
+        await state.update_data(scenes=final_scenes_with_photos)
+        await state.set_state(PhotoAIStates.confirming_photos)
+        
+        await processing_msg.delete()
+        
+        # Показываем ВСЕ СЦЕНЫ + ВСЕ ФОТО еще раз
+        await show_all_scenes_and_photos_for_confirmation(callback.message, state)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка переделывания фото: {e}")
+        error_text = str(e)
+        
+        # ✅ Специальная обработка ошибки E005
+        if "E005" in error_text or "sensitive" in error_text.lower():
+            help_text = (
+                f"❌ Ошибка: Фильтр безопасности API при переделке фото\n\n"
+                f"💡 Советы:\n"
+                f"- Избегайте слов о реальных людях\n"
+                f"- Используйте более абстрактные описания\n"
+                f"- Попробуйте фантастический или художественный стиль"
+            )
+        else:
+            help_text = f"❌ Ошибка при переделке фото:\n{error_text[:150]}"
+        
+        await processing_msg.edit_text(help_text)
+
+
+@router.callback_query(lambda c: c.data == "photo_ai_edit_all_scenes")
+async def edit_all_scenes(callback: types.CallbackQuery, state: FSMContext):
+    """✏️ Редактировать все сцены"""
+    await callback.answer()
+    
+    await callback.message.answer(
+        "✏️ Редактирование сцен:\n\n"
+        "Отправь новый промт для всех сцен,\n"
+        "и система переделает фото с новыми промтами."
+    )
+    
+    await state.set_state(PhotoAIStates.waiting_prompt)
 
 
 @router.callback_query(lambda c: c.data.startswith("photo_ai_scene_approve_"))
@@ -405,8 +670,75 @@ async def regenerate_scenes(callback: types.CallbackQuery, state: FSMContext):
         await processing_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
 
 
+async def start_photo_generation_immediate(message: types.Message, state: FSMContext, status_msg=None):
+    """НОВЫЙ процесс: Генерация фото СРАЗУ после GPT разбиения - ПАРАЛЛЕЛЬНО для всех сцен
+    
+    Показывает фото вместе с информацией о сцене (промт, атмосфера, длительность)
+    как с референсом, так и без него
+    """
+    data = await state.get_data()
+    scenes = data.get("scenes", [])
+    aspect_ratio = data.get("aspect_ratio", "16:9")
+    reference_url = data.get("reference_url")
+    general_prompt = data.get("enhanced_prompt", "")
+    
+    await state.set_state(PhotoAIStates.generating_photos)
+    
+    try:
+        photo_gen = PhotoGenerator()
+        
+        # ПАРАЛЛЕЛЬНАЯ генерация фото для всех сцен
+        logger.info(f"📸 Генерирую фото для {len(scenes)} сцен параллельно...")
+        logger.info(f"   Соотношение: {aspect_ratio}")
+        logger.info(f"   Референс: {'ДА 📸' if reference_url else 'НЕТ'}")
+        
+        # ✅ generate_photos_for_scenes уже async, поэтому просто await
+        photos_result = await photo_gen.generate_photos_for_scenes(
+            scenes=scenes,
+            aspect_ratio=aspect_ratio,
+            reference_image_url=reference_url,
+            general_prompt=general_prompt
+        )
+        
+        if photos_result["status"] == "success":
+            scenes_with_photos = photos_result["scenes_with_photos"]
+            successful = photos_result["successful_photos"]
+            total = photos_result["total_scenes"]
+            
+            await state.update_data(
+                scenes_with_photos=scenes_with_photos,
+                current_scene_index=0
+            )
+            await state.set_state(PhotoAIStates.confirming_photos)
+            
+            # Удаляю статус сообщение если есть
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
+            
+            logger.info(f"✅ Фото готовы! Успешно: {successful}/{total}")
+            
+            # ✅ Показываем первое фото с полной информацией
+            await show_photo_for_confirmation(message, state, 0)
+            
+        else:
+            error = photos_result.get("error", "Unknown error")
+            logger.error(f"❌ Ошибка генерации: {error}")
+            if status_msg:
+                await status_msg.edit_text(f"❌ Ошибка: {error}")
+            await state.clear()
+            
+    except Exception as e:
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА генерации фото: {e}", exc_info=True)
+        if status_msg:
+            await status_msg.edit_text(f"❌ Ошибка: {str(e)[:150]}")
+        await state.clear()
+
+
 async def start_photo_generation(message: types.Message, state: FSMContext):
-    """Начало генерации фото через google/nano-banana"""
+    """Генерация фото (старый процесс с подтверждением сцен)"""
     data = await state.get_data()
     scenes = data.get("scenes", [])
     aspect_ratio = data.get("aspect_ratio", "16:9")
@@ -462,9 +794,19 @@ async def start_photo_generation(message: types.Message, state: FSMContext):
 
 
 async def show_photo_for_confirmation(message: types.Message, state: FSMContext, scene_index: int):
-    """Показывает фото для подтверждения"""
+    """Показывает фото для подтверждения с информацией о сцене, атмосфере и генерации
+    
+    Отображает:
+    - Номер сцены и фото
+    - Полный промт
+    - Атмосферу и длительность
+    - Информацию о использовании референса
+    - Фото как изображение
+    """
     data = await state.get_data()
     scenes_with_photos = data.get("scenes_with_photos", [])
+    reference_url = data.get("reference_url")
+    aspect_ratio = data.get("aspect_ratio", "16:9")
     
     if scene_index >= len(scenes_with_photos):
         await start_video_generation_final(message, state)
@@ -475,7 +817,12 @@ async def show_photo_for_confirmation(message: types.Message, state: FSMContext,
     
     if not photo_url:
         error_msg = scene.get("photo_error", "Ошибка генерации")
-        text = f"⚠️ Сцена {scene_index + 1}: Ошибка\n{error_msg}\n\nПропускаю..."
+        text = (
+            f"⚠️ Сцена {scene_index + 1}: Ошибка\n"
+            f"{'─' * 50}\n"
+            f"{error_msg}\n\n"
+            f"Пропускаю эту сцену..."
+        )
         await message.answer(text)
         
         next_index = scene_index + 1
@@ -486,13 +833,20 @@ async def show_photo_for_confirmation(message: types.Message, state: FSMContext,
     prompt_full = scene.get('prompt', '')
     atmosphere = scene.get('atmosphere', 'N/A')
     
+    # Информация о генерации с учетом референса
+    reference_info = "📸 С референсом" if reference_url else "🎨 Без референса"
+    
     scene_text = (
-        f"🖼️ Сцена {scene_index + 1} из {len(scenes_with_photos)}\n"
-        f"{'─' * 50}\n\n"
-        f"📝 Промт для фото:\n    {prompt_full}\n\n"
-        f"⏱️  Длительность: 5 сек\n"
-        f"🎨 Атмосфера: {atmosphere}\n"
-        f"{'─' * 50}\n\n"
+        f"🖼️ Фото {scene_index + 1} из {len(scenes_with_photos)}\n"
+        f"{'═' * 50}\n\n"
+        f"📝 **Промт для фото:**\n"
+        f"{prompt_full}\n\n"
+        f"{'─' * 50}\n"
+        f"⏱️  **Длительность:** 5 сек\n"
+        f"🎨 **Атмосфера:** {atmosphere}\n"
+        f"📐 **Соотношение:** {aspect_ratio}\n"
+        f"🎬 **Генератор:** google/nano-banana {reference_info}\n"
+        f"{'═' * 50}\n\n"
         f"Подходит ли это фото?"
     )
     
@@ -809,23 +1163,63 @@ async def start_video_generation_final(message: types.Message, state: FSMContext
 
 
 def _extract_num_scenes_from_prompt(prompt: str) -> int:
-    """Извлекает количество сцен из промта"""
+    """Извлекает количество сцен из промта - ищет МАКСИМАЛЬНОЕ число!
+    
+    Обработает:
+    - Цифры: "1 сцене", "2 сцены", "на 3 сцены"
+    - Порядковые числительные: "во второй сцене", "в третьей сцене"
+    """
     import re
     
+    # ✅ Ищу ВСЕ числа связанные со сценами
     patterns = [
-        r'(\d+)\s*сцен',
-        r'(\d+)\s*scene',
-        r'на\s*(\d+)\s*сцен',
-        r'разбить на\s*(\d+)',
-        r'(\d+)\s*частей',
-        r'split.*?(\d+)',
+        r'(\d+)\s*сцен',          # "1 сцене", "2 сцены"
+        r'(\d+)\s*scene',         # "1 scene", "2 scenes"
+        r'на\s*(\d+)\s*сцен',     # "на 2 сцены"
+        r'разбить на\s*(\d+)',    # "разбить на 3"
+        r'(\d+)\s*частей',        # "3 части"
+        r'split.*?(\d+)',         # "split 4"
+        r'сцена\s*(\d+)',         # "сцена 2"
+        r'scene\s*(\d+)',         # "scene 3"
     ]
     
+    # Словарь для преобразования порядковых числительных в цифры
+    ordinal_map = {
+        'перв': 1, 'первая': 1, 'первой': 1, 'первую': 1,
+        'втор': 2, 'вторая': 2, 'второй': 2, 'вторую': 2,
+        'трет': 3, 'третья': 3, 'третьей': 3, 'третью': 3,
+        'четвёрт': 4, 'четвертая': 4, 'четвёртой': 4,
+        'пят': 5, 'пятая': 5, 'пятой': 5,
+        'шест': 6, 'шестая': 6, 'шестой': 6,
+        'сед': 7, 'седьмая': 7, 'седьмой': 7,
+        'восьм': 8, 'восьмая': 8, 'восьмой': 8,
+        'девят': 9, 'девятая': 9, 'девятой': 9,
+        'десят': 10, 'десятая': 10, 'десятой': 10,
+    }
+    
+    found_numbers = []
+    
+    # Ищу цифры в стандартных паттернах
     for pattern in patterns:
-        match = re.search(pattern, prompt, re.IGNORECASE)
-        if match:
-            num = int(match.group(1))
+        matches = re.findall(pattern, prompt, re.IGNORECASE)
+        for match in matches:
+            num = int(match)
             if 1 <= num <= 20:
-                return num
+                found_numbers.append(num)
+    
+    # Ищу порядковые числительные (например "во второй сцене", "в третьей")
+    ordinal_pattern = r'(первой|первую|вторая|второй|вторую|третья|третьей|третью|четвёртая|четвёртой|четвертая|четвертой|пятая|пятой|шестая|шестой|седьмая|седьмой|восьмая|восьмой|девятая|девятой|десятая|десятой)\s*сцен'
+    matches = re.findall(ordinal_pattern, prompt, re.IGNORECASE)
+    for match in matches:
+        match_lower = match.lower()
+        # Ищу совпадение в словаре
+        for key, num in ordinal_map.items():
+            if key in match_lower:
+                found_numbers.append(num)
+                break
+    
+    # ✅ Если нашли числа - берём максимальное (для "1 сцене ... 2 сцене" или "в первой ... во второй")
+    if found_numbers:
+        return max(found_numbers)
     
     return 3  # По умолчанию 3 сцены
