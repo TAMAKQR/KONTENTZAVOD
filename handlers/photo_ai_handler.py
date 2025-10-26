@@ -483,11 +483,16 @@ async def show_photo_for_confirmation(message: types.Message, state: FSMContext,
         await show_photo_for_confirmation(message, state, next_index)
         return
     
+    prompt_full = scene.get('prompt', '')
+    atmosphere = scene.get('atmosphere', 'N/A')
+    
     scene_text = (
         f"🖼️ Сцена {scene_index + 1} из {len(scenes_with_photos)}\n"
-        f"{'─' * 40}\n\n"
-        f"📝 Промт: {scene.get('prompt', '')[:100]}...\n"
-        f"🎨 Атмосфера: {scene.get('atmosphere', 'N/A')}\n\n"
+        f"{'─' * 50}\n\n"
+        f"📝 Промт для фото:\n    {prompt_full}\n\n"
+        f"⏱️  Длительность: 5 сек\n"
+        f"🎨 Атмосфера: {atmosphere}\n"
+        f"{'─' * 50}\n\n"
         f"Подходит ли это фото?"
     )
     
@@ -495,7 +500,10 @@ async def show_photo_for_confirmation(message: types.Message, state: FSMContext,
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Далее", callback_data=f"photo_ai_photo_approve_{scene_index}"),
-                InlineKeyboardButton(text="🔄 Регенерировать", callback_data=f"photo_ai_photo_regen_{scene_index}")
+                InlineKeyboardButton(text="🔄 Переделать", callback_data=f"photo_ai_photo_regen_{scene_index}")
+            ],
+            [
+                InlineKeyboardButton(text="✏️ Изменить промт", callback_data=f"photo_ai_photo_edit_{scene_index}")
             ],
             [
                 InlineKeyboardButton(text="✅ Принять все", callback_data="photo_ai_photos_final"),
@@ -509,13 +517,14 @@ async def show_photo_for_confirmation(message: types.Message, state: FSMContext,
             await message.answer_photo(
                 types.FSInputFile(scene["photo_path"]),
                 caption=scene_text,
-                reply_markup=keyboard
+                reply_markup=keyboard,
+                parse_mode="Markdown"
             )
         else:
-            await message.answer(scene_text, reply_markup=keyboard)
+            await message.answer(scene_text, reply_markup=keyboard, parse_mode="Markdown")
     except Exception as e:
         logger.warning(f"⚠️ Ошибка отправки фото: {e}")
-        await message.answer(scene_text, reply_markup=keyboard)
+        await message.answer(scene_text, reply_markup=keyboard, parse_mode="Markdown")
 
 
 @router.callback_query(lambda c: c.data.startswith("photo_ai_photo_approve_"))
@@ -534,6 +543,171 @@ async def approve_photo(callback: types.CallbackQuery, state: FSMContext):
         await show_photo_for_confirmation(callback.message, state, next_index)
     else:
         await start_video_generation_final(callback.message, state)
+
+
+@router.callback_query(lambda c: c.data.startswith("photo_ai_photo_regen_"))
+async def regenerate_photo(callback: types.CallbackQuery, state: FSMContext):
+    """Регенерирование фото для конкретной сцены"""
+    await callback.answer()
+    scene_index = int(callback.data.replace("photo_ai_photo_regen_", ""))
+    
+    data = await state.get_data()
+    scenes_with_photos = data.get("scenes_with_photos", [])
+    aspect_ratio = data.get("aspect_ratio", "16:9")
+    reference_url = data.get("reference_url")
+    general_prompt = data.get("enhanced_prompt", "")
+    
+    if scene_index >= len(scenes_with_photos):
+        await callback.message.answer("❌ Сцена не найдена")
+        return
+    
+    scene = scenes_with_photos[scene_index]
+    
+    regenerating_msg = await callback.message.answer(
+        f"🎨 Регенерирую фото для сцены {scene_index + 1}...\n"
+        f"⏳ Это может занять минуту..."
+    )
+    
+    try:
+        photo_gen = PhotoGenerator()
+        
+        # Генерирую одно фото
+        prompt = scene.get('prompt', general_prompt)
+        result = await photo_gen._generate_single_photo(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            reference_image_url=reference_url,
+            scene_index=scene_index
+        )
+        
+        if result.get("status") == "success":
+            # Обновляю сцену с новым фото
+            scene["photo_url"] = result.get("photo_url")
+            scene["photo_path"] = result.get("photo_path")
+            
+            scenes_with_photos[scene_index] = scene
+            await state.update_data(scenes_with_photos=scenes_with_photos)
+            
+            await regenerating_msg.delete()
+            
+            # Показываю обновленное фото
+            await state.set_state(PhotoAIStates.confirming_photos)
+            await show_photo_for_confirmation(callback.message, state, scene_index)
+        else:
+            error = result.get("error", "Unknown error")
+            await regenerating_msg.edit_text(f"❌ Ошибка: {error}")
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка регенерации фото: {e}")
+        await regenerating_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+
+
+@router.callback_query(lambda c: c.data.startswith("photo_ai_photo_edit_"))
+async def edit_photo_prompt(callback: types.CallbackQuery, state: FSMContext):
+    """Редактирование промта для фото"""
+    await callback.answer()
+    scene_index = int(callback.data.replace("photo_ai_photo_edit_", ""))
+    
+    await state.update_data(editing_photo_index=scene_index)
+    await state.set_state(PhotoAIStates.editing_scene)
+    
+    data = await state.get_data()
+    scenes_with_photos = data.get("scenes_with_photos", [])
+    
+    if scene_index >= len(scenes_with_photos):
+        await callback.message.answer("❌ Сцена не найдена")
+        return
+    
+    scene = scenes_with_photos[scene_index]
+    current_prompt = scene.get('prompt', '')
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Готово", callback_data=f"photo_ai_photo_edit_done_{scene_index}")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_to_menu")]
+        ]
+    )
+    
+    await callback.message.answer(
+        f"✏️ Редактирование промта для сцены {scene_index + 1}\n\n"
+        f"Текущий промт:\n{current_prompt}\n\n"
+        f"Напиши новый промт или нажми Готово:",
+        reply_markup=keyboard
+    )
+
+
+@router.message(PhotoAIStates.editing_scene)
+async def process_photo_prompt_edit(message: types.Message, state: FSMContext):
+    """Обработка отредактированного промта для фото"""
+    data = await state.get_data()
+    scene_index = data.get("editing_photo_index")
+    
+    if scene_index is not None:
+        scenes_with_photos = data.get("scenes_with_photos", [])
+        
+        if scene_index < len(scenes_with_photos):
+            scenes_with_photos[scene_index]['prompt'] = message.text
+            await state.update_data(scenes_with_photos=scenes_with_photos)
+            await message.answer(f"✅ Промт сцены {scene_index + 1} обновлен!")
+    
+    await state.set_state(PhotoAIStates.confirming_photos)
+
+
+@router.callback_query(lambda c: c.data.startswith("photo_ai_photo_edit_done_"))
+async def photo_edit_done(callback: types.CallbackQuery, state: FSMContext):
+    """Завершение редактирования промта и регенерация фото"""
+    await callback.answer()
+    scene_index = int(callback.data.replace("photo_ai_photo_edit_done_", ""))
+    
+    data = await state.get_data()
+    scenes_with_photos = data.get("scenes_with_photos", [])
+    aspect_ratio = data.get("aspect_ratio", "16:9")
+    reference_url = data.get("reference_url")
+    general_prompt = data.get("enhanced_prompt", "")
+    
+    if scene_index >= len(scenes_with_photos):
+        await callback.message.answer("❌ Сцена не найдена")
+        return
+    
+    scene = scenes_with_photos[scene_index]
+    
+    regenerating_msg = await callback.message.answer(
+        f"🎨 Генерирую новое фото с обновленным промтом...\n"
+        f"⏳ Это может занять минуту..."
+    )
+    
+    try:
+        photo_gen = PhotoGenerator()
+        
+        # Генерирую одно фото с новым промтом
+        prompt = scene.get('prompt', general_prompt)
+        result = await photo_gen._generate_single_photo(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            reference_image_url=reference_url,
+            scene_index=scene_index
+        )
+        
+        if result.get("status") == "success":
+            # Обновляю сцену с новым фото
+            scene["photo_url"] = result.get("photo_url")
+            scene["photo_path"] = result.get("photo_path")
+            
+            scenes_with_photos[scene_index] = scene
+            await state.update_data(scenes_with_photos=scenes_with_photos)
+            
+            await regenerating_msg.delete()
+            
+            # Показываю обновленное фото
+            await state.set_state(PhotoAIStates.confirming_photos)
+            await show_photo_for_confirmation(callback.message, state, scene_index)
+        else:
+            error = result.get("error", "Unknown error")
+            await regenerating_msg.edit_text(f"❌ Ошибка: {error}")
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка: {e}")
+        await regenerating_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
 
 
 @router.callback_query(lambda c: c.data == "photo_ai_photos_final")
