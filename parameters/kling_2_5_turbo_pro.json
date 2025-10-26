@@ -1,0 +1,58 @@
+{
+  "model": "kwaivgi/kling-v2.5-turbo-pro",
+  "model_name": "Kling 2.5 Turbo Pro",
+  "type": "text-to-video",
+  "description": "Text-to-video and image-to-video generation with smooth motion and cinematic depth",
+  "pricing": {
+    "per_second": 0.07,
+    "note": "~14 seconds for $1"
+  },
+  "parameters": {
+    "prompt": {
+      "type": "string",
+      "required": true,
+      "description": "Text prompt for video generation"
+    },
+    "duration": {
+      "type": "integer",
+      "enum": [5, 10],
+      "default": 5,
+      "description": "Duration of the video in seconds"
+    },
+    "aspect_ratio": {
+      "type": "string",
+      "enum": ["16:9", "9:16", "1:1"],
+      "default": "16:9",
+      "description": "Aspect ratio of the video"
+    },
+    "start_image": {
+      "type": "string",
+      "format": "uri",
+      "nullable": true,
+      "description": "First frame of the video (for image-to-video)"
+    },
+    "negative_prompt": {
+      "type": "string",
+      "default": "",
+      "description": "Things you do not want to see in the video"
+    }
+  },
+  "default_settings": {
+    "duration": 5,
+    "aspect_ratio": "16:9",
+    "negative_prompt": ""
+  },
+  "features": [
+    "Better prompt understanding",
+    "More realistic motion & stability",
+    "Detail & style consistency",
+    "Complex camera movements",
+    "High-speed action support"
+  ],
+  "use_cases": [
+    "Marketing & Brand Teams",
+    "Creators / YouTubers / Shorts Teams",
+    "Film/Animation Studios",
+    "Education & Training"
+  ]
+}
