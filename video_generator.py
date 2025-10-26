@@ -43,13 +43,14 @@ class VideoGenerator:
             }
         }
 
-    async def enhance_prompt_with_gpt(self, prompt: str, num_scenes: int = 3) -> Dict:
+    async def enhance_prompt_with_gpt(self, prompt: str, num_scenes: int = 3, duration_per_scene: int = 5) -> Dict:
         """
         Улучшает промт через GPT-4 и разбивает на сцены
         
         Args:
             prompt: Оригинальный промт
             num_scenes: Количество сцен
+            duration_per_scene: Длительность каждой сцены в секундах
             
         Returns:
             Dict с улучшенным промтом и сценами
@@ -66,7 +67,7 @@ Return JSON with this exact structure:
         {{
             "id": 1,
             "prompt": "detailed scene 1 prompt",
-            "duration": 5,
+            "duration": {duration_per_scene},
             "atmosphere": "scene atmosphere"
         }}
     ]
@@ -75,7 +76,7 @@ Return JSON with this exact structure:
 Rules:
 - Each scene must flow smoothly to the next
 - Each scene prompt must be 1-2 sentences, detailed and specific
-- Duration: 5 seconds for all scenes
+- Duration: {duration_per_scene} seconds for all scenes
 - Atmosphere: cinematic, dramatic, calm, energetic, etc
 - Create exactly {num_scenes} scenes
 - Scenes must connect logically and visually"""
@@ -429,3 +430,74 @@ Return ONLY valid JSON with translated content, nothing else."""
         
         logger.info(f"✅ Параллельная генерация завершена. Результаты: {len(processed_results)} сцен")
         return processed_results
+
+    async def generate_photo(
+        self,
+        prompt: str,
+        model: str = "google/nano-banana",
+        reference_url: Optional[str] = None,
+        scene_number: int = 1
+    ) -> Dict:
+        """
+        Генерирует фото через google/nano-banana
+        
+        Args:
+            prompt: Промт для генерации фото
+            model: Модель (google/nano-banana или google/imagen-4)
+            reference_url: URL фото-референса для стилизации
+            scene_number: Номер сцены для логирования
+            
+        Returns:
+            Dict с результатом или ошибкой
+        """
+        try:
+            logger.info(f"📸 Сцена {scene_number}: Генерирую фото через {model}...")
+            logger.info(f"   Промт: {prompt[:60]}...")
+            
+            # Подготавливаем параметры
+            input_params = {
+                "prompt": prompt,
+            }
+            
+            # Если есть референс, добавляем его
+            if reference_url and model == "google/nano-banana":
+                input_params["image"] = reference_url
+                input_params["strength"] = 0.7  # Сила применения стиля референса
+                logger.info(f"   Используется referencias для стилизации")
+            
+            logger.info(f"🎬 Сцена {scene_number}: Отправляю запрос на Replicate API...")
+            logger.info(f"   Model: {model}")
+            
+            # Используем синхронный replicate.run в потоке
+            loop = asyncio.get_event_loop()
+            output = await loop.run_in_executor(
+                None,
+                lambda: self.replicate_client.run(
+                    model,
+                    input=input_params
+                )
+            )
+            
+            output_str = str(output) if output else "None"
+            logger.info(f"✅ Сцена {scene_number}: Фото сгенерировано!")
+            logger.info(f"   URL: {output_str[:80]}...")
+            
+            return {
+                "status": "success",
+                "photo_url": output_str,
+                "model": model,
+                "scene_number": scene_number
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Сцена {scene_number}: Ошибка генерации фото!")
+            logger.error(f"   Ошибка: {str(e)}")
+            logger.error(f"   Тип: {type(e).__name__}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "model": model,
+                "scene_number": scene_number
+            }
