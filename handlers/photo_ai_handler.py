@@ -78,7 +78,7 @@ async def choose_photo_ai_model(callback: types.CallbackQuery, state: FSMContext
     
     await callback.message.answer(
         "✅ Модель: 🎬 Kling v2.5 Turbo Pro\n"
-        "{'─' * 40}\n\n"
+        f"{'─' * 40}\n\n"
         "📐 Выбери соотношение сторон для фото и видео:",
         reply_markup=keyboard
     )
