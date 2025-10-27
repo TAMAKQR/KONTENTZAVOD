@@ -151,11 +151,19 @@ Create {num_scenes} unique scenes with {duration_per_scene}sec each."""
                 if "atmosphere" not in scene:
                     scene["atmosphere"] = "cinematic"
             
-            logger.info(f"✅ GPT создал {len(result['scenes'])} РАЗНЫХ сцен")
+            logger.info(f"✅ GPT создал {len(result['scenes'])} сцен")
+            
+            # Логируем сцены ДО перевода
+            for i, scene in enumerate(result['scenes']):
+                logger.info(f"   📝 Сцена {i+1} (ДО перевода): '{scene.get('prompt', '')}'")
             
             # Переводим сцены на русский язык
             logger.info(f"🌍 Переводу сцены на русский...")
             result = await self._translate_scenes_to_russian(result)
+            
+            # Логируем сцены ПОСЛЕ перевода
+            for i, scene in enumerate(result['scenes']):
+                logger.info(f"   🇷🇺 Сцена {i+1} (ПОСЛЕ перевода): '{scene.get('prompt', '')}'")
             
             return result
             
@@ -201,6 +209,10 @@ Create {num_scenes} unique scenes with {duration_per_scene}sec each."""
                     "atmosphere": "cinematic"
                 })
             
+            # Логируем каждую созданную сцену
+            for scene in scenes:
+                logger.info(f"   ✅ Сцена {scene['id']}: '{scene['prompt']}'")
+            
             return {
                 "enhanced_prompt": prompt,
                 "scenes": scenes
@@ -220,6 +232,10 @@ Create {num_scenes} unique scenes with {duration_per_scene}sec each."""
             scenes = scenes_result.get("scenes", [])
             if not scenes:
                 return scenes_result
+            
+            logger.info(f"🌍 _translate_scenes_to_russian: получил {len(scenes)} сцен")
+            for i, scene in enumerate(scenes):
+                logger.info(f"   INPUT Сцена {i+1}: '{scene.get('prompt', '')}'[:100]")
             
             # Подготавливаем текст для перевода
             scenes_to_translate = []
@@ -295,6 +311,11 @@ Return ONLY valid JSON with translated content, nothing else."""
                 scenes_result["enhanced_prompt"] = enhanced_translation
             
             logger.info(f"✅ Сцены переведены на русский язык")
+            
+            # Логируем результат после перевода
+            for i, scene in enumerate(scenes):
+                logger.info(f"   OUTPUT Сцена {i+1}: '{scene.get('prompt', '')}'[:100]")
+            
             return scenes_result
             
         except Exception as e:

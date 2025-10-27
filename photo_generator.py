@@ -60,6 +60,8 @@ class PhotoGenerator:
             
             for idx, scene in enumerate(scenes):
                 logger.info(f"\n📸 Сцена {idx + 1}/{len(scenes)} обработка...")
+                logger.info(f"   🔹 Исходный scene['prompt']: {scene.get('prompt', '')}")
+                logger.info(f"   🔹 Атмосфера: {scene.get('atmosphere', '')}")
                 
                 # Создаю расширенный промт для фото
                 scene_prompt = self._create_photo_prompt(
@@ -151,7 +153,7 @@ class PhotoGenerator:
                 logger.info(f"   📐 Используем aspect_ratio='match_input_image' для reference-режима")
             
             logger.info(f"🎬 Вызываю replicate для генерации фото (сцена {scene_index + 1})...")
-            logger.info(f"   📝 Промт: {prompt[:80]}...")
+            logger.info(f"   📝 ПОЛНЫЙ ПРОМТ:\n{prompt}")
             logger.info(f"   📐 Соотношение: {aspect_ratio}")
             if reference_image_url:
                 logger.info(f"   ✅ С использованием референс-изображения")
