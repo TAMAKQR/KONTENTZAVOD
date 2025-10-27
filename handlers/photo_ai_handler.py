@@ -281,6 +281,14 @@ async def process_prompt(message: types.Message, state: FSMContext):
         scenes = scenes_result["scenes"]
         enhanced_prompt = scenes_result.get("enhanced_prompt", "")
         
+        # 🔒 Убеждаемся, что у каждой сцены есть промт (защита от бага)
+        for i, scene in enumerate(scenes, 1):
+            if not scene.get("prompt"):
+                logger.error(f"❌ КРИТИЧНО: Сцена {i} потеряла промт в GPT обработке!")
+                # Восстанавливаем хотя бы что-то
+                scene["prompt"] = f"Сцена {i} - часть описания: {message.text[:80]}"
+                logger.warning(f"   ✅ Восстановлен fallback промт: '{scene['prompt'][:50]}'")
+        
         # ✅ ТОЛЬКО ПОКАЗЫВАЕМ что идет обработка (БЕЗ дублирования информации)
         await processing_msg.edit_text(
             f"✅ GPT-4 ОБРАБОТКА ЗАВЕРШЕНА!\n"

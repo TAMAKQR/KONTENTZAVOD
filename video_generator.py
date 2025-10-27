@@ -5,8 +5,8 @@ import logging
 from typing import Optional, List, Dict
 import replicate
 from replicate import Client
-from config import REPLICATE_API_TOKEN, OPENAI_API_KEY
-from openai import AsyncOpenAI
+import google.generativeai as genai
+from config import REPLICATE_API_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,13 @@ class VideoGenerator:
     def __init__(self):
         self.replicate_token = REPLICATE_API_TOKEN
         self.replicate_client = Client(api_token=REPLICATE_API_TOKEN)
-        self.openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        
+        # Инициализируем Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
+        # Используем gemini-2.5-flash - последняя доступная модель (1.5 была выведена из обслуживания)
+        self.gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        logger.info(f"✅ Gemini инициализирован вместо OpenAI")
         
         # Модели
         self.models = {
@@ -83,17 +89,16 @@ IMPORTANT:
 
 Create {num_scenes} unique scenes with {duration_per_scene}sec each."""
 
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.8,
-                max_tokens=2000
+            # Используем Gemini вместо OpenAI
+            full_message = f"{system_message}\n\nUSER: {user_message}"
+            
+            response = await asyncio.to_thread(
+                self.gemini_model.generate_content,
+                full_message
             )
             
-            response_text = response.choices[0].message.content.strip()
+            response_text = response.text.strip()
+            logger.info(f"🤖 Gemini ответ получен")
             logger.info(f"📝 GPT ответ получен, длина: {len(response_text)} символов")
             
             # Парсим JSON - ищем массив
@@ -255,42 +260,76 @@ Scenes to translate:
 
 Return ONLY valid JSON with translated content, nothing else."""
             
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a professional translator from English to Russian. Translate video scene descriptions accurately and naturally."},
-                    {"role": "user", "content": translation_request}
-                ],
-                temperature=0.3,
-                max_tokens=2000
+            system_prompt = "You are a professional translator from English to Russian. Translate video scene descriptions accurately and naturally."
+            full_message = f"{system_prompt}\n\n{translation_request}"
+            
+            # Используем Gemini для перевода
+            response = await asyncio.to_thread(
+                self.gemini_model.generate_content,
+                full_message
             )
             
-            response_text = response.choices[0].message.content.strip()
-            logger.info(f"🌍 GPT перевод ответ: {response_text[:150]}...")
+            response_text = response.text.strip()
+            logger.info(f"🤖 Gemini перевод ответ: {response_text[:150]}...")
             
-            # Парсим переведенные сцены
-            if "```json" in response_text:
-                start_idx = response_text.find('{')
-                end_idx = response_text.rfind('}') + 1
-            elif "```" in response_text:
-                start_idx = response_text.find('[')
-                end_idx = response_text.rfind(']') + 1
-                if start_idx == -1:
-                    start_idx = response_text.find('{')
-                    end_idx = response_text.rfind('}') + 1
-            else:
-                start_idx = response_text.find('[')
-                end_idx = response_text.rfind(']') + 1
-                if start_idx == -1:
-                    start_idx = response_text.find('{')
-                    end_idx = response_text.rfind('}') + 1
+            # Парсим переведенные сцены - удаляем markdown backticks
+            cleaned_response = response_text
+            if "```json" in cleaned_response:
+                cleaned_response = cleaned_response.replace("```json", "").replace("```", "")
+            elif "```" in cleaned_response:
+                cleaned_response = cleaned_response.replace("```", "")
             
-            if start_idx == -1 or end_idx == 0:
-                logger.warning(f"⚠️ Не удалось распарсить переведенные сцены, используем оригинальные")
+            cleaned_response = cleaned_response.strip()
+            
+            # Ищем JSON (может быть список или объект)
+            translated_list = None
+            try:
+                # Сначала попробуем как список
+                start_idx = cleaned_response.find('[')
+                if start_idx != -1:
+                    # Считаем скобки чтобы найти конец
+                    bracket_count = 0
+                    end_idx = start_idx
+                    for i, char in enumerate(cleaned_response[start_idx:]):
+                        if char == '[':
+                            bracket_count += 1
+                        elif char == ']':
+                            bracket_count -= 1
+                            if bracket_count == 0:
+                                end_idx = start_idx + i + 1
+                                break
+                    
+                    if end_idx > start_idx:
+                        translated_text = cleaned_response[start_idx:end_idx]
+                        translated_list = json.loads(translated_text)
+                
+                # Если не список, попробуем как объект
+                if translated_list is None:
+                    start_idx = cleaned_response.find('{')
+                    if start_idx != -1:
+                        bracket_count = 0
+                        end_idx = start_idx
+                        for i, char in enumerate(cleaned_response[start_idx:]):
+                            if char == '{':
+                                bracket_count += 1
+                            elif char == '}':
+                                bracket_count -= 1
+                                if bracket_count == 0:
+                                    end_idx = start_idx + i + 1
+                                    break
+                        
+                        if end_idx > start_idx:
+                            translated_text = cleaned_response[start_idx:end_idx]
+                            translated_list = json.loads(translated_text)
+            
+            except json.JSONDecodeError as je:
+                logger.warning(f"⚠️ JSON парсинг ошибка: {je}")
+                logger.warning(f"⚠️ Чистый ответ: {cleaned_response[:200]}...")
                 return scenes_result
             
-            translated_text = response_text[start_idx:end_idx]
-            translated_list = json.loads(translated_text)
+            if translated_list is None:
+                logger.warning(f"⚠️ Не удалось распарсить переведенные сцены, используем оригинальные")
+                return scenes_result
             
             # Если это не список, преобразуем в список
             if not isinstance(translated_list, list):
@@ -300,10 +339,12 @@ Return ONLY valid JSON with translated content, nothing else."""
             for i, scene in enumerate(scenes):
                 if i < len(translated_list):
                     translated = translated_list[i]
-                    if "prompt" in translated:
+                    if "prompt" in translated and translated["prompt"]:
                         scene["prompt"] = translated["prompt"]
-                    if "atmosphere" in translated:
+                    if "atmosphere" in translated and translated["atmosphere"]:
                         scene["atmosphere"] = translated["atmosphere"]
+                else:
+                    logger.warning(f"⚠️ Перевод не получен для сцены {i+1}, оставляю оригинальный текст")
             
             # Переводим enhanced_prompt если есть
             if "enhanced_prompt" in scenes_result:
@@ -312,6 +353,16 @@ Return ONLY valid JSON with translated content, nothing else."""
                 scenes_result["enhanced_prompt"] = enhanced_translation
             
             logger.info(f"✅ Сцены переведены на русский язык")
+            
+            # 🔒 Убеждаемся, что у каждой сцены есть промт
+            for i, scene in enumerate(scenes):
+                if not scene.get('prompt'):
+                    logger.error(f"❌ КРИТИЧНО: Сцена {i+1} потеряла промт! Это баг в переводе")
+                    # Пытаемся восстановить из оригинала
+                    if i < len(scenes_to_translate):
+                        original_prompt = scenes_to_translate[i].get('prompt', f'Сцена {i+1}')
+                        scene['prompt'] = original_prompt
+                        logger.warning(f"   ✅ Восстановлен оригинальный промт: '{original_prompt[:50]}'")
             
             # Логируем результат после перевода
             for i, scene in enumerate(scenes):
@@ -336,21 +387,73 @@ Return ONLY valid JSON with translated content, nothing else."""
             Переведенный текст
         """
         try:
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a professional translator. Translate to Russian accurately."},
-                    {"role": "user", "content": f"Translate to Russian: {text}"}
-                ],
-                temperature=0.3,
-                max_tokens=500
+            system_prompt = "You are a professional translator. Translate to Russian accurately."
+            full_message = f"{system_prompt}\n\nTranslate to Russian: {text}"
+            
+            # Используем Gemini для перевода
+            response = await asyncio.to_thread(
+                self.gemini_model.generate_content,
+                full_message
             )
             
-            return response.choices[0].message.content.strip()
+            return response.text.strip()
             
         except Exception as e:
             logger.warning(f"⚠️ Ошибка при переводе текста: {e}")
             return text
+
+    async def enhance_video_prompt_with_image(self, image_url: str, original_prompt: str, scene_number: int = 1) -> str:
+        """
+        Анализирует фото через Gemini Vision и улучшает промт для видео
+        Это новый подход: сначала фото генерируется, потом Gemini его анализирует и создает промт для видео
+        
+        Args:
+            image_url: URL сгенерированного фото
+            original_prompt: Оригинальный промт сцены
+            scene_number: Номер сцены для логирования
+            
+        Returns:
+            Улучшенный промт для видео на основе анализа фото
+        """
+        try:
+            logger.info(f"🎬 Сцена {scene_number}: Анализирую фото через Gemini Vision...")
+            
+            # Создаем промт для Gemini Vision
+            vision_prompt = f"""You are a professional video director. Analyze this product/subject image and create an improved video prompt.
+
+ORIGINAL PROMPT: {original_prompt}
+
+Based on what you see in the image:
+1. Describe the visual style, lighting, and composition
+2. Suggest the best camera movement for a video
+3. Create a dynamic video prompt that builds on this visual
+
+Return ONLY the enhanced video prompt (2-3 sentences), nothing else."""
+
+            # Используем Gemini с изображением
+            image_content = [
+                vision_prompt,
+                {
+                    "mime_type": "image/jpeg",
+                    "data": image_url  # URL изображения
+                }
+            ]
+            
+            response = await asyncio.to_thread(
+                self.gemini_model.generate_content,
+                [vision_prompt, {"mime_type": "image/jpeg", "data": image_url}] if image_url.startswith('http') else vision_prompt
+            )
+            
+            enhanced_prompt = response.text.strip()
+            logger.info(f"✅ Сцена {scene_number}: Промт улучшен через Vision анализ")
+            logger.info(f"   Улучшенный промт: {enhanced_prompt[:100]}...")
+            
+            return enhanced_prompt
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка при анализе фото (сцена {scene_number}): {e}")
+            logger.warning(f"   Используем оригинальный промт")
+            return original_prompt
 
     async def generate_scene(
         self,
