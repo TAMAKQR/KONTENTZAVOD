@@ -39,7 +39,9 @@ class PhotoGenerator:
         general_prompt: str = ""
     ) -> dict:
         """
-        Генерирует фото для каждой сцены ПАРАЛЛЕЛЬНО
+        Генерирует фото для каждой сцены ПОСЛЕДОВАТЕЛЬНО с наследованием
+        
+        Каждое фото становится референсом для следующей сцены для обеспечения целостности.
         
         Args:
             scenes: Список сцен с промтами
@@ -50,52 +52,49 @@ class PhotoGenerator:
         Returns:
             {"status": "success", "scenes_with_photos": [...]} или {"status": "error", "error": "..."}
         """
-        logger.info(f"🎨 Генерирую фото для {len(scenes)} сцен ПАРАЛЛЕЛЬНО...")
+        logger.info(f"🎨 Генерирую фото для {len(scenes)} сцен ПОСЛЕДОВАТЕЛЬНО с наследованием...")
         
         try:
-            # 1️⃣ Создаю список промтов для всех сцен
-            generation_tasks = []
+            scenes_with_photos = []
+            current_reference_url = reference_image_url  # Начальный референс (если есть)
             
             for idx, scene in enumerate(scenes):
-                logger.info(f"📸 Сцена {idx + 1}/{len(scenes)} отправляется на генерацию...")
+                logger.info(f"\n📸 Сцена {idx + 1}/{len(scenes)} обработка...")
                 
                 # Создаю расширенный промт для фото
                 scene_prompt = self._create_photo_prompt(
                     scene=scene,
-                    reference_image_url=reference_image_url,
+                    reference_image_url=current_reference_url,
                     general_prompt=general_prompt,
                     scene_index=idx,
                     total_scenes=len(scenes)
                 )
                 
-                # Добавляю задачу (НЕ ждём!)
-                task = self._generate_single_photo(
+                # Генерирую фото для текущей сцены (ЖДУ результат!)
+                photo_result = await self._generate_single_photo(
                     prompt=scene_prompt,
                     aspect_ratio=aspect_ratio,
-                    reference_image_url=reference_image_url,
+                    reference_image_url=current_reference_url,
                     scene_index=idx
                 )
-                generation_tasks.append(task)
-            
-            # 2️⃣ Запускаю все задачи параллельно
-            logger.info(f"⚡ Все {len(scenes)} сцен запущены параллельно к Replicate API!")
-            photo_results = await asyncio.gather(*generation_tasks)
-            
-            # 3️⃣ Обрабатываю результаты
-            scenes_with_photos = []
-            for idx, photo_result in enumerate(photo_results):
-                scene = scenes[idx]
                 
+                # Обрабатываю результат
                 if photo_result["status"] == "success":
                     scene["photo_url"] = photo_result["photo_url"]
                     scene["photo_path"] = photo_result.get("photo_path")
                     scenes_with_photos.append(scene)
-                    logger.info(f"✅ Фото для сцены {idx + 1} готово")
+                    
+                    # 🔑 КЛЮЧЕВОЙ МОМЕНТ: Фото текущей сцены становится референсом для следующей!
+                    current_reference_url = photo_result["photo_url"]
+                    logger.info(f"✅ Фото сцены {idx + 1} готово → будет использовано как референс для сцены {idx + 2}")
                 else:
                     logger.warning(f"⚠️ Ошибка фото сцены {idx + 1}: {photo_result['error']}")
+                    logger.info(f"⚠️ Переходу к следующей сцене без референса...")
                     scene["photo_url"] = None
                     scene["photo_error"] = photo_result["error"]
                     scenes_with_photos.append(scene)
+                    # Не меняем current_reference_url, чтобы использовать последнее успешное фото
+                    # (или исходный референс, если ни одно фото не было сгенерировано)
             
             return {
                 "status": "success",
@@ -134,9 +133,10 @@ class PhotoGenerator:
         """
         try:
             # Подготавливаю параметры для google/nano-banana
-            # По умолчанию: aspect_ratio = "match_input_image"
-            # Альтернативы: "16:9", "9:16", "1:1" (но работают только без reference)
-            determined_aspect_ratio = "match_input_image" if reference_image_url else aspect_ratio
+            # ✅ ВСЕГДА используем выбранный aspect_ratio (не match_input_image)
+            # Это гарантирует, что фото генерируется в выбранном формате (16:9, 9:16, 1:1)
+            # независимо от размера загруженного референса
+            determined_aspect_ratio = aspect_ratio
             
             input_params = {
                 "prompt": prompt,
@@ -171,12 +171,21 @@ class PhotoGenerator:
             # Результат может быть File объектом, список, или строка
             if hasattr(output, 'url'):
                 # ✅ File объект от Replicate
-                photo_url = output.url()
+                # url может быть методом или свойством
+                url_attr = getattr(output, 'url')
+                if callable(url_attr):
+                    photo_url = url_attr()
+                else:
+                    photo_url = str(url_attr)
                 logger.info(f"✅ Получен File объект: {photo_url[:100]}...")
             elif isinstance(output, list) and len(output) > 0:
                 # ✅ Список File объектов или URLs
                 if hasattr(output[0], 'url'):
-                    photo_url = output[0].url()
+                    url_attr = getattr(output[0], 'url')
+                    if callable(url_attr):
+                        photo_url = url_attr()
+                    else:
+                        photo_url = str(url_attr)
                     logger.info(f"✅ Получен список File объектов: {photo_url[:100]}...")
                 else:
                     photo_url = str(output[0])
@@ -215,7 +224,48 @@ class PhotoGenerator:
             logger.error(f"❌ Ошибка генерации фото сцены {scene_index + 1}: {error_msg}")
             
             # ✅ Обработка различных ошибок API
-            if "E005" in error_msg and retry_count < 2:
+            if "E004" in error_msg and retry_count < 3:
+                # E004 - Service is temporarily unavailable
+                logger.warning(f"⚠️ Сервис недоступен (E004, попытка {retry_count + 1}/3) - пытаюсь еще раз...")
+                
+                # Постепенное увеличение времени ожидания
+                wait_time = 5 + (retry_count * 3)
+                logger.info(f"⏳ Жду {wait_time} сек перед повторной попыткой...")
+                await asyncio.sleep(wait_time)
+                
+                # На каждой попытке - пробуем упростить параметры
+                if retry_count < 1:
+                    # Попытка 1: как есть, но ждем
+                    return await self._generate_single_photo(
+                        prompt=prompt,
+                        aspect_ratio=aspect_ratio,
+                        reference_image_url=reference_image_url,
+                        scene_index=scene_index,
+                        retry_count=retry_count + 1
+                    )
+                elif retry_count < 2:
+                    # Попытка 2: без reference
+                    logger.info(f"🔄 Попытка 2: генерируем БЕЗ reference")
+                    return await self._generate_single_photo(
+                        prompt=prompt,
+                        aspect_ratio=aspect_ratio,
+                        reference_image_url=None,
+                        scene_index=scene_index,
+                        retry_count=retry_count + 1
+                    )
+                else:
+                    # Попытка 3: упрощаем промт
+                    logger.info(f"🔄 Попытка 3: упрощаю промт")
+                    simplified_prompt = self._simplify_prompt_for_api(prompt)
+                    return await self._generate_single_photo(
+                        prompt=simplified_prompt,
+                        aspect_ratio=aspect_ratio,
+                        reference_image_url=None,
+                        scene_index=scene_index,
+                        retry_count=retry_count + 1
+                    )
+            
+            elif "E005" in error_msg and retry_count < 2:
                 # E005 - Фильтр безопасности (sensitive content)
                 logger.warning(f"⚠️ Фильтр безопасности (E005) - пытаюсь с улучшенным промтом...")
                 
@@ -232,19 +282,48 @@ class PhotoGenerator:
                     retry_count=retry_count + 1
                 )
             
-            elif "E6716" in error_msg and retry_count < 1:
-                # E6716 - Unexpected error handling prediction
-                logger.warning(f"⚠️ Ошибка API (E6716) - пытаюсь еще раз...")
-                await asyncio.sleep(2)  # Пауза перед retry
+            elif "E6716" in error_msg and retry_count < 3:
+                # E6716 - Unexpected error handling prediction (от Replicate API)
+                logger.warning(f"⚠️ Ошибка API (E6716, попытка {retry_count + 1}/3) - пытаюсь еще раз...")
                 
-                # Retry без санитизации (это может быть временная проблема API)
-                return await self._generate_single_photo(
-                    prompt=prompt,
-                    aspect_ratio=aspect_ratio,
-                    reference_image_url=reference_image_url,
-                    scene_index=scene_index,
-                    retry_count=retry_count + 1
-                )
+                # На первой попытке retry - просто ждем и повторяем
+                if retry_count == 0:
+                    await asyncio.sleep(3)
+                    logger.info(f"🔄 Повторная попытка 1: без изменений")
+                    return await self._generate_single_photo(
+                        prompt=prompt,
+                        aspect_ratio=aspect_ratio,
+                        reference_image_url=reference_image_url,
+                        scene_index=scene_index,
+                        retry_count=retry_count + 1
+                    )
+                
+                # На второй попытке - пробуем без reference для упрощения
+                elif retry_count == 1:
+                    await asyncio.sleep(3)
+                    logger.info(f"🔄 Повторная попытка 2: генерируем БЕЗ reference для упрощения")
+                    # Повторяем без reference_image_url
+                    return await self._generate_single_photo(
+                        prompt=prompt,
+                        aspect_ratio="16:9",  # Упрощаем aspect_ratio тоже
+                        reference_image_url=None,  # Убираем reference
+                        scene_index=scene_index,
+                        retry_count=retry_count + 1
+                    )
+                
+                # На третьей попытке - упрощаем сам промт (убираем детали)
+                elif retry_count == 2:
+                    await asyncio.sleep(3)
+                    logger.info(f"🔄 Повторная попытка 3: упрощаю промт")
+                    simplified_prompt = self._simplify_prompt_for_api(prompt)
+                    logger.info(f"   Упрощенный промт: {simplified_prompt[:100]}...")
+                    return await self._generate_single_photo(
+                        prompt=simplified_prompt,
+                        aspect_ratio="16:9",
+                        reference_image_url=None,
+                        scene_index=scene_index,
+                        retry_count=retry_count + 1
+                    )
             
             return {
                 "status": "error",
@@ -272,6 +351,66 @@ class PhotoGenerator:
         except Exception as e:
             logger.warning(f"⚠️ Ошибка сохранения фото: {e}")
             return None
+    
+    def _simplify_prompt_for_api(self, prompt: str) -> str:
+        """
+        Упрощает промт для API Replicate при ошибках E6716 или E004
+        
+        Убирает:
+        - Лишние детали о позиции и сценах
+        - Форматирование и спецсимволы
+        - Оставляет только основное описание и атмосферу
+        - Сохраняет инструкцию про БЕЗ ТЕКСТА
+        """
+        import re
+        
+        # Оставляем только первую часть до "Атмосфера" или первый параграф
+        lines = prompt.split('\n')
+        simplified = []
+        has_no_text_instruction = False
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Сохраняем инструкцию про отсутствие текста
+            if 'Без текста' in line or 'без надписей' in line or 'без логотипов' in line:
+                has_no_text_instruction = True
+                continue
+            
+            # Пропускаем служебные строки
+            if line.startswith('Позиция:') or line.startswith('Длительность'):
+                continue
+            
+            # Пропускаем служебные инструкции
+            if 'Сцена' in line and 'из' in line:
+                continue
+            
+            # Если строка про атмосферу - оставляем только атмосферу
+            if line.startswith('Атмосфера:'):
+                simplified.append(line.replace('Атмосфера:', '').strip())
+                break
+            
+            simplified.append(line)
+        
+        # Объединяем и убираем лишние пробелы
+        simplified_text = ' '.join(simplified)
+        simplified_text = re.sub(r'\s+', ' ', simplified_text).strip()
+        
+        # Если результат пуст - используем первую строку оригинала
+        if not simplified_text and prompt:
+            simplified_text = prompt.split('\n')[0][:200]
+        
+        # Добавляем инструкцию про БЕЗ ТЕКСТА в конец
+        if has_no_text_instruction or 'Без текста' in prompt:
+            simplified_text += " (no text, no text overlays, clean image only)"
+        
+        logger.info(f"✂️ Промт упрощен:")
+        logger.info(f"   До: {prompt[:150]}...")
+        logger.info(f"   После: {simplified_text[:150]}...")
+        
+        return simplified_text[:400]  # Ограничиваем до 400 символов
     
     def _sanitize_prompt_for_safety(self, prompt: str) -> str:
         """
@@ -331,6 +470,7 @@ class PhotoGenerator:
         - Атмосферу
         - Позицию в видео (для плавных переходов)
         - Общий стиль видео
+        - ✅ БЕЗ ТЕКСТА на изображении
         """
         
         scene_prompt = scene.get("prompt", "")
@@ -349,13 +489,14 @@ class PhotoGenerator:
         if scene_index < total_scenes - 1:
             position_context += " - подготовка к следующей сцене"
         
-        # Формирую финальный промт
+        # ✅ Формирую финальный промт БЕЗ ТЕКСТА
         extended_prompt = (
             f"{reference_instruction}"
             f"{scene_prompt}\n"
             f"Атмосфера: {atmosphere}\n"
             f"Позиция: {position_context}\n"
             f"Длительность сцены: {duration} секунд\n"
+            f"⚠️ ВАЖНО: Без текста, без надписей, без логотипов, чистое изображение\n"
         )
         
         if general_prompt:

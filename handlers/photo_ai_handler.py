@@ -16,6 +16,47 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+# ✅ ХЕЛПЕР: Сохранение результатов в JSON для ИИ
+async def save_scenes_result_to_json(message: types.Message, scenes: list, enhanced_prompt: str, aspect_ratio: str = "16:9"):
+    """Сохраняет результаты генерации фото в JSON формат для ИИ"""
+    from datetime import datetime
+    
+    try:
+        user_id = message.from_user.id if message.from_user else "unknown"
+        
+        json_result = {
+            "timestamp": datetime.now().isoformat(),
+            "user_id": user_id,
+            "enhanced_prompt": enhanced_prompt,
+            "num_scenes": len(scenes),
+            "aspect_ratio": aspect_ratio,
+            "scenes": []
+        }
+        
+        for i, scene in enumerate(scenes, 1):
+            scene_data = {
+                "scene_number": i,
+                "prompt": scene.get("prompt", ""),
+                "duration": scene.get("duration", 5),
+                "atmosphere": scene.get("atmosphere", ""),
+                "photo_path": scene.get("photo_path", ""),
+                "photo_url": scene.get("photo_url", ""),
+                "photo_error": scene.get("photo_error", None)
+            }
+            json_result["scenes"].append(scene_data)
+        
+        # Сохраняем JSON файл
+        json_path = f"d:\\VIDEO\\temp_images\\scene_result_{user_id}_{int(datetime.now().timestamp())}.json"
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(json_result, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"✅ JSON результат сохранен: {json_path}")
+        return json_path
+    except Exception as e:
+        logger.error(f"❌ Ошибка при сохранении JSON: {e}")
+        return None
+
+
 class PhotoAIStates(StatesGroup):
     """Состояния для создания видео Текст + Фото + AI"""
     choosing_model = State()  # Выбор модели (только kling)
@@ -239,15 +280,18 @@ async def process_prompt(message: types.Message, state: FSMContext):
         )
         
         scenes = scenes_result["scenes"]
+        enhanced_prompt = scenes_result.get("enhanced_prompt", "")
         
+        # ✅ ТОЛЬКО ПОКАЗЫВАЕМ что идет обработка (БЕЗ дублирования информации)
         await processing_msg.edit_text(
-            f"⏳ Разбито на {len(scenes)} сцен ✅\n"
-            f"{'─' * 40}\n"
-            f"📸 Генерирую фото для всех сцен (параллель)...\n"
-            f"⏳ Это займет 30-60 сек..."
+            f"✅ GPT-4 ОБРАБОТКА ЗАВЕРШЕНА!\n"
+            f"{'═' * 50}\n\n"
+            f"📸 Генерирую фото для {len(scenes)} сцен...\n"
+            f"⏳ Это займет 1-2 мин (каждое фото наследует от предыдущего)...\n\n"
+            f"Результаты будут показаны ниже ↓"
         )
         
-        # ✅ ШАГ 1: Генерируем ВСЕ ФОТО ПАРАЛЛЕЛЬНО
+        # ✅ ШАГ 1: Генерируем ФОТО ПОСЛЕДОВАТЕЛЬНО С НАСЛЕДОВАНИЕМ
         photo_gen = PhotoGenerator()
         
         # Получаем URL референса из state, если был загружен
@@ -285,8 +329,16 @@ async def process_prompt(message: types.Message, state: FSMContext):
         
         await state.update_data(
             scenes=final_scenes_with_photos,
-            enhanced_prompt=scenes_result["enhanced_prompt"],
+            enhanced_prompt=enhanced_prompt,
             current_photo_index=0
+        )
+        
+        # ✅ СОХРАНЯЕМ результаты в JSON для ИИ (используя хелпер)
+        await save_scenes_result_to_json(
+            message=message,
+            scenes=final_scenes_with_photos,
+            enhanced_prompt=enhanced_prompt,
+            aspect_ratio=data.get("aspect_ratio", "16:9")
         )
         
         # ✅ ШАГ 3: Показываем ВСЕ СЦЕНЫ + ВСЕ ФОТО для подтверждения
@@ -324,6 +376,7 @@ async def show_all_scenes_and_photos_for_confirmation(message: types.Message, st
     """✅ НОВОЕ: Показывает КАЖДУЮ СЦЕНУ + её ФОТО вместе для подтверждения"""
     data = await state.get_data()
     scenes = data.get("scenes", [])
+    enhanced_prompt = data.get("enhanced_prompt", "")
     
     if not scenes:
         await message.answer("❌ Ошибка: нет сцен")
@@ -333,10 +386,10 @@ async def show_all_scenes_and_photos_for_confirmation(message: types.Message, st
     successful_photos_count = sum(1 for s in scenes if s.get("photo_url") or s.get("photo_path"))
     failed_photos_count = len(scenes) - successful_photos_count
     
-    # Показываем каждую сцену вместе с её фотографией
+    # ✅ Показываем ИНФОРМАЦИЮ + ФОТО для каждой сцены
     for i, scene in enumerate(scenes, 1):
-        # Формируем текст для этой сцены
-        scene_text = f"🎬 СЦЕНА {i} из {len(scenes)}\n"
+        # Формируем информацию сцены
+        scene_text = f"🎬 СЦЕНА {i}/{len(scenes)}\n"
         scene_text += "─" * 40 + "\n"
         scene_text += f"📝 Промт: {scene.get('prompt', 'N/A')}\n"
         scene_text += f"⏱️ Длительность: {scene.get('duration', 5)} сек\n"
@@ -371,9 +424,10 @@ async def show_all_scenes_and_photos_for_confirmation(message: types.Message, st
                 logger.warning(f"⚠️ Не смог отправить фото сцены {i}: {e}")
                 await message.answer(f"⚠️ Ошибка при отправке фото сцены {i}: {str(e)[:80]}")
         else:
+            error_reason = scene.get('photo_error', 'Ошибка генерации')
             await message.answer(
-                f"❌ Фото для сцены {i} не найдено\n\n"
-                f"Причина: {scene.get('photo_error', 'Ошибка генерации')}"
+                f"⚠️ Фото для сцены {i} не найдено\n\n"
+                f"Причина: {error_reason}"
             )
     
     # В конце показываем финальное сообщение с кнопками подтверждения
@@ -489,8 +543,8 @@ async def regenerate_all_photos(callback: types.CallbackQuery, state: FSMContext
     aspect_ratio = data.get("aspect_ratio", "16:9")
     
     processing_msg = await callback.message.answer(
-        f"🔄 Переделаю фото для всех {len(scenes)} сцен...\n"
-        f"⏳ Это займет 30-60 сек..."
+        f"🔄 Переделаю фото для всех {len(scenes)} сцен ПОСЛЕДОВАТЕЛЬНО...\n"
+        f"⏳ Это займет 1-2 мин (с наследованием между сценами)..."
     )
     
     # Переходим обратно к генерации фото
@@ -521,6 +575,16 @@ async def regenerate_all_photos(callback: types.CallbackQuery, state: FSMContext
             )
         
         await state.update_data(scenes=final_scenes_with_photos)
+        
+        # ✅ СОХРАНЯЕМ результаты переделки в JSON
+        enhanced_prompt = data.get("enhanced_prompt", "")
+        await save_scenes_result_to_json(
+            message=callback.message,
+            scenes=final_scenes_with_photos,
+            enhanced_prompt=enhanced_prompt,
+            aspect_ratio=aspect_ratio
+        )
+        
         await state.set_state(PhotoAIStates.confirming_photos)
         
         await processing_msg.delete()
@@ -687,10 +751,11 @@ async def start_photo_generation_immediate(message: types.Message, state: FSMCon
     try:
         photo_gen = PhotoGenerator()
         
-        # ПАРАЛЛЕЛЬНАЯ генерация фото для всех сцен
-        logger.info(f"📸 Генерирую фото для {len(scenes)} сцен параллельно...")
+        # ПОСЛЕДОВАТЕЛЬНАЯ генерация фото для всех сцен с наследованием
+        logger.info(f"📸 Генерирую фото для {len(scenes)} сцен ПОСЛЕДОВАТЕЛЬНО...")
         logger.info(f"   Соотношение: {aspect_ratio}")
         logger.info(f"   Референс: {'ДА 📸' if reference_url else 'НЕТ'}")
+        logger.info(f"   Каждое фото будет использовано как референс для следующего")
         
         # ✅ generate_photos_for_scenes уже async, поэтому просто await
         photos_result = await photo_gen.generate_photos_for_scenes(
@@ -709,6 +774,16 @@ async def start_photo_generation_immediate(message: types.Message, state: FSMCon
                 scenes_with_photos=scenes_with_photos,
                 current_scene_index=0
             )
+            
+            # ✅ СОХРАНЯЕМ результаты в JSON
+            enhanced_prompt = general_prompt or data.get("enhanced_prompt", "")
+            await save_scenes_result_to_json(
+                message=message,
+                scenes=scenes_with_photos,
+                enhanced_prompt=enhanced_prompt,
+                aspect_ratio=aspect_ratio
+            )
+            
             await state.set_state(PhotoAIStates.confirming_photos)
             
             # Удаляю статус сообщение если есть
@@ -769,6 +844,15 @@ async def start_photo_generation(message: types.Message, state: FSMContext):
             successful = photos_result["successful_photos"]
             
             await state.update_data(scenes_with_photos=scenes_with_photos)
+            
+            # ✅ СОХРАНЯЕМ результаты в JSON
+            await save_scenes_result_to_json(
+                message=message,
+                scenes=scenes_with_photos,
+                enhanced_prompt=general_prompt,
+                aspect_ratio=aspect_ratio
+            )
+            
             await state.set_state(PhotoAIStates.confirming_photos)
             
             await generating_msg.edit_text(
