@@ -52,16 +52,11 @@ async def choose_animation_model(callback: types.CallbackQuery, state: FSMContex
     await state.update_data(model=model)
     await state.set_state(AnimationStates.waiting_for_image)
     
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]]
-    )
-    
     model_name = callback.data.replace("model_", "").replace("_anim", "").upper()
     
     await callback.message.answer(
         f"✅ Модель выбрана: {model_name}\n\n"
-        f"📤 Теперь отправь картину, которую ты хочешь анимировать:",
-        reply_markup=keyboard
+        f"📤 Теперь отправь картину, которую ты хочешь анимировать:"
     )
 
 
@@ -72,15 +67,10 @@ async def process_animation_image(message: types.Message, state: FSMContext):
         await state.update_data(image_id=message.photo[-1].file_id)
         await state.set_state(AnimationStates.waiting_for_prompt)
         
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]]
-        )
-        
         await message.answer(
             "✅ Картина получена!\n\n"
             "Теперь опиши, как ты хочешь её анимировать:\n"
-            "(например: 'волнующееся море', 'летящие птицы')",
-            reply_markup=keyboard
+            "(например: 'волнующееся море', 'летящие птицы')"
         )
     else:
         await message.answer("❌ Пожалуйста, отправь изображение")
