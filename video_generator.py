@@ -45,7 +45,7 @@ class VideoGenerator:
 
     async def enhance_prompt_with_gpt(self, prompt: str, num_scenes: int = 3, duration_per_scene: int = 5) -> Dict:
         """
-        Улучшает промт через GPT-4 и разбивает на сцены
+        Улучшает промт через GPT-4 и разбивает на РАЗНЫЕ сцены
         
         Args:
             prompt: Оригинальный промт
@@ -53,102 +53,157 @@ class VideoGenerator:
             duration_per_scene: Длительность каждой сцены в секундах
             
         Returns:
-            Dict с улучшенным промтом и сценами
+            Dict с улучшенным промтом и уникальными сценами
         """
         try:
-            system_message = f"""You are a professional video script writer. Analyze the user's prompt and break it down into exactly {num_scenes} connected scenes.
+            # 📝 УЛУЧШЕННАЯ ИНСТРУКЦИЯ для GPT
+            system_message = """You are a professional video director. Create unique, visually distinct scenes from a product/concept description.
 
-IMPORTANT: Return ONLY valid JSON, nothing else. No markdown, no explanations.
+RULES:
+1. Return ONLY valid JSON, no markdown or explanations
+2. Create DIFFERENT angles/moments for each scene (not repetition)
+3. Each scene must have a unique visual perspective
+4. Keep prompts concise but vivid (1-2 sentences)
 
-Return JSON with this exact structure:
-{{
-    "enhanced_prompt": "enhanced overall video description",
-    "scenes": [
-        {{
-            "id": 1,
-            "prompt": "detailed scene 1 prompt",
-            "duration": {duration_per_scene},
-            "atmosphere": "scene atmosphere"
-        }}
-    ]
-}}
+REQUIRED JSON FORMAT - Return valid JSON array like this:
+[
+  {"id": 1, "prompt": "scene description with unique angle/moment", "duration": 5, "atmosphere": "cinematic"},
+  {"id": 2, "prompt": "different perspective or progression", "duration": 5, "atmosphere": "dramatic"}
+]"""
 
-Rules:
-- Each scene must flow smoothly to the next
-- Each scene prompt must be 1-2 sentences, detailed and specific
-- Duration: {duration_per_scene} seconds for all scenes
-- Atmosphere: cinematic, dramatic, calm, energetic, etc
-- Create exactly {num_scenes} scenes
-- Scenes must connect logically and visually"""
+            user_message = f"""Break this into {num_scenes} VISUALLY DIFFERENT scenes (not parts of same scene):
+
+CONCEPT: {prompt}
+
+IMPORTANT: 
+- Scene 1: Opening/approach view
+- Scene 2: Detail/close-up or different angle  
+- Scene 3+: Progression or new perspective
+- Each must show something new, not repeat
+
+Create {num_scenes} unique scenes with {duration_per_scene}sec each."""
 
             response = await self.openai_client.chat.completions.create(
                 model="gpt-4",
                 messages=[
                     {"role": "system", "content": system_message},
-                    {"role": "user", "content": f"Create {num_scenes} connected video scenes from this prompt: {prompt}"}
+                    {"role": "user", "content": user_message}
                 ],
-                temperature=0.7,
+                temperature=0.8,
                 max_tokens=2000
             )
             
-            # Парсим JSON из ответа
             response_text = response.choices[0].message.content.strip()
-            logger.info(f"📝 GPT ответ: {response_text[:200]}...")
+            logger.info(f"📝 GPT ответ получен, длина: {len(response_text)} символов")
             
-            # Ищем JSON в ответе (может быть обернут в markdown)
-            if "```json" in response_text:
-                start_idx = response_text.find('{')
-                end_idx = response_text.rfind('}') + 1
-            elif "```" in response_text:
-                start_idx = response_text.find('{')
-                end_idx = response_text.rfind('}') + 1
-            else:
-                start_idx = response_text.find('{')
-                end_idx = response_text.rfind('}') + 1
+            # Парсим JSON - ищем массив
+            start_idx = response_text.find('[')
+            end_idx = response_text.rfind(']') + 1
             
             if start_idx == -1 or end_idx == 0:
-                logger.error(f"❌ JSON не найден в ответе: {response_text}")
-                raise ValueError("JSON not found in response")
+                # Если нет массива, ищем объект
+                start_idx = response_text.find('{')
+                end_idx = response_text.rfind('}') + 1
+                
+                if start_idx == -1 or end_idx == 0:
+                    logger.error(f"❌ JSON не найден в ответе: {response_text[:200]}")
+                    raise ValueError("JSON not found in response")
+                
+                # Если один объект - оборачиваем в массив
+                json_str = response_text[start_idx:end_idx]
+                result = {"scenes": [json.loads(json_str)]}
+            else:
+                json_str = response_text[start_idx:end_idx]
+                scenes_list = json.loads(json_str)
+                result = {
+                    "enhanced_prompt": prompt,
+                    "scenes": scenes_list if isinstance(scenes_list, list) else [scenes_list]
+                }
             
-            json_str = response_text[start_idx:end_idx]
-            logger.info(f"🔍 Извлеченный JSON: {json_str[:100]}...")
-            
-            result = json.loads(json_str)
-            
-            # Валидация результата
+            # Валидация и нормализация
             if "scenes" not in result:
-                raise ValueError("'scenes' key not found in response")
+                result["scenes"] = result if isinstance(result, list) else [result]
             
             if not isinstance(result["scenes"], list):
-                raise ValueError("'scenes' must be a list")
+                result["scenes"] = [result["scenes"]]
             
-            if len(result["scenes"]) != num_scenes:
-                logger.warning(f"⚠️ GPT создал {len(result['scenes'])} сцен вместо {num_scenes}")
+            # Обеспечиваем ровно num_scenes сцен
+            actual_scenes = result.get("scenes", [])
+            if len(actual_scenes) < num_scenes:
+                logger.warning(f"⚠️ GPT создал {len(actual_scenes)} вместо {num_scenes}, дополняю...")
+                # Добавляем недостающие сцены как вариации
+                for i in range(len(actual_scenes), num_scenes):
+                    actual_scenes.append({
+                        "id": i + 1,
+                        "prompt": f"{prompt} - угол {i + 1}",
+                        "duration": duration_per_scene,
+                        "atmosphere": "cinematic"
+                    })
+            elif len(actual_scenes) > num_scenes:
+                actual_scenes = actual_scenes[:num_scenes]
             
-            logger.info(f"✅ GPT улучшил промт, создано {len(result['scenes'])} сцен")
+            result["scenes"] = actual_scenes
+            
+            # Присваиваем ID и длительность
+            for i, scene in enumerate(result["scenes"]):
+                scene["id"] = i + 1
+                scene["duration"] = duration_per_scene
+                if "atmosphere" not in scene:
+                    scene["atmosphere"] = "cinematic"
+            
+            logger.info(f"✅ GPT создал {len(result['scenes'])} РАЗНЫХ сцен")
             
             # Переводим сцены на русский язык
-            logger.info(f"🌍 Переводу сцены на русский язык...")
+            logger.info(f"🌍 Переводу сцены на русский...")
             result = await self._translate_scenes_to_russian(result)
             
             return result
             
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Ошибка парсинга JSON: {e}")
+            logger.error(f"❌ Ответ: {response_text[:300]}")
+            raise
         except Exception as e:
             logger.error(f"❌ Ошибка при обработке GPT: {e}")
             logger.error(f"❌ Детали: {str(e)}")
-            # Фоллбак - просто создаем сцены из оригинального промта
-            logger.info(f"⚠️ Использую фоллбак: разделяю промт на {num_scenes} сцены")
+            
+            # ⚠️ Лучший фоллбак - создаем РАЗНЫЕ сцены вручную
+            logger.info(f"⚠️ Создаю {num_scenes} РАЗНЫХ сцен автоматически...")
+            scenes = [
+                {
+                    "id": 1,
+                    "prompt": f"{prompt} - общий план",
+                    "duration": duration_per_scene,
+                    "atmosphere": "cinematic"
+                },
+                {
+                    "id": 2,
+                    "prompt": f"{prompt} - крупный план деталей",
+                    "duration": duration_per_scene,
+                    "atmosphere": "dramatic"
+                }
+            ]
+            
+            # Добавляем третью и последующие сцены если нужно
+            if num_scenes > 2:
+                scenes.append({
+                    "id": 3,
+                    "prompt": f"{prompt} - финальный ракурс",
+                    "duration": duration_per_scene,
+                    "atmosphere": "cinematic"
+                })
+            
+            for i in range(3, num_scenes):
+                scenes.append({
+                    "id": i + 1,
+                    "prompt": f"{prompt} - перспектива {i}",
+                    "duration": duration_per_scene,
+                    "atmosphere": "cinematic"
+                })
+            
             return {
                 "enhanced_prompt": prompt,
-                "scenes": [
-                    {
-                        "id": i + 1,
-                        "prompt": f"{prompt} - Часть {i + 1}",
-                        "duration": 5,
-                        "atmosphere": "cinematic"
-                    }
-                    for i in range(num_scenes)
-                ]
+                "scenes": scenes
             }
     
     async def _translate_scenes_to_russian(self, scenes_result: Dict) -> Dict:
