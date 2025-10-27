@@ -53,6 +53,7 @@ class PhotoGenerator:
             {"status": "success", "scenes_with_photos": [...]} или {"status": "error", "error": "..."}
         """
         logger.info(f"🎨 Генерирую фото для {len(scenes)} сцен ПОСЛЕДОВАТЕЛЬНО с наследованием...")
+        logger.info(f"🔍 DEBUG generate_photos_for_scenes: reference_image_url = {reference_image_url}")
         
         try:
             scenes_with_photos = []
@@ -146,17 +147,19 @@ class PhotoGenerator:
                 "output_format": "jpg"
             }
             
-            # Если есть референс - добавляю его как массив (image_input)
+            # Если есть референс - добавляю его (для google/nano-banana используется параметр "image_input")
+            logger.info(f"🔍 DEBUG: reference_image_url = {reference_image_url}")
             if reference_image_url:
-                input_params["image_input"] = [reference_image_url]  # ✅ Должен быть массив!
-                logger.info(f"   📸 Референс: {reference_image_url[:80]}...")
-                logger.info(f"   📐 Используем aspect_ratio='match_input_image' для reference-режима")
+                input_params["image_input"] = [reference_image_url]  # ✅ Правильный параметр для nano-banana! (должен быть массив)
+                logger.info(f"   📸 Референс добавлен: {reference_image_url[:80]}...")
+                logger.info(f"   📐 Режим генерации: на основе референса")
+            else:
+                logger.warning(f"   ⚠️ reference_image_url пуст или None!")
             
             logger.info(f"🎬 Вызываю replicate для генерации фото (сцена {scene_index + 1})...")
             logger.info(f"   📝 ПОЛНЫЙ ПРОМТ:\n{prompt}")
             logger.info(f"   📐 Соотношение: {aspect_ratio}")
-            if reference_image_url:
-                logger.info(f"   ✅ С использованием референс-изображения")
+            logger.info(f"📋 ФИНАЛЬНЫЕ ПАРАМЕТРЫ: {input_params}")
             
             # Вызываю replicate асинхронно (БЕЗ api_token параметра!)
             output = await asyncio.to_thread(

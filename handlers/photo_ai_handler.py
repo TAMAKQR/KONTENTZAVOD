@@ -10,7 +10,6 @@ from aiogram.filters import StateFilter
 from video_generator import VideoGenerator
 from photo_generator import PhotoGenerator
 from video_stitcher import VideoStitcher
-from image_utils import ImageUploader
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -215,12 +214,12 @@ async def process_reference_image(message: types.Message, state: FSMContext):
     """Обработка загруженного референса"""
     if message.photo:
         try:
-            uploader = ImageUploader()
-            reference_url = await uploader.process_telegram_photo(
-                message.bot,
-                message.photo[-1].file_id,
-                photo_name="reference"
-            )
+            # ✅ Получаем прямую ссылку на фото из Telegram (вместо загрузки на ImgBB)
+            # Это проще и надежнее для использования с Replicate API
+            file = await message.bot.get_file(message.photo[-1].file_id)
+            reference_url = f"https://api.telegram.org/file/bot{message.bot.token}/{file.file_path}"
+            
+            logger.info(f"✅ Получена Telegram ссылка на фото: {reference_url[:80]}...")
             
             if reference_url:
                 await state.update_data(reference_url=reference_url)
@@ -296,10 +295,12 @@ async def process_prompt(message: types.Message, state: FSMContext):
         
         # Получаем URL референса из state, если был загружен
         reference_url = data.get("reference_url")
+        logger.info(f"🔍 DEBUG photo_ai_handler: reference_url = {reference_url}")
+        logger.info(f"🔍 DEBUG photo_ai_handler: все данные в state = {list(data.keys())}")
         if reference_url:
             logger.info(f"📸 Используем reference_url: {reference_url[:80]}...")
         else:
-            logger.info(f"📸 Генерация без reference (режим: без референса)")
+            logger.info(f"📸 Генерация БЕЗ reference (reference_url пуст/None)")
         
         photos_result = await photo_gen.generate_photos_for_scenes(
             scenes=scenes,
