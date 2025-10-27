@@ -235,7 +235,8 @@ Create {num_scenes} unique scenes with {duration_per_scene}sec each."""
             
             logger.info(f"🌍 _translate_scenes_to_russian: получил {len(scenes)} сцен")
             for i, scene in enumerate(scenes):
-                logger.info(f"   INPUT Сцена {i+1}: '{scene.get('prompt', '')}'[:100]")
+                prompt_text = scene.get('prompt', '')[:100]
+                logger.info(f"   INPUT Сцена {i+1}: '{prompt_text}'")
             
             # Подготавливаем текст для перевода
             scenes_to_translate = []
@@ -314,7 +315,8 @@ Return ONLY valid JSON with translated content, nothing else."""
             
             # Логируем результат после перевода
             for i, scene in enumerate(scenes):
-                logger.info(f"   OUTPUT Сцена {i+1}: '{scene.get('prompt', '')}'[:100]")
+                prompt_text = scene.get('prompt', '')[:100]
+                logger.info(f"   OUTPUT Сцена {i+1}: '{prompt_text}'")
             
             return scenes_result
             
