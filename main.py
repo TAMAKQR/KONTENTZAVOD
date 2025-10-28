@@ -31,9 +31,8 @@ async def cmd_start(message: types.Message):
     """Обработчик команды /start"""
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📹 Текст → Видео", callback_data="video")],
-            [InlineKeyboardButton(text="📸 Текст → Фото", callback_data="photo_ai")],
-            [InlineKeyboardButton(text="🎨 Анимирование картины", callback_data="animation")],
+            [InlineKeyboardButton(text="📹 Создать видео", callback_data="video")],
+            [InlineKeyboardButton(text="🎨 Анимировать картину", callback_data="animation")],
             [InlineKeyboardButton(text="🖼️ Редактировать фото", callback_data="photo")],
         ]
     )
@@ -52,9 +51,8 @@ async def back_to_menu(callback: types.CallbackQuery, state: FSMContext):
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📹 Текст → Видео", callback_data="video")],
-            [InlineKeyboardButton(text="📸 Текст → Фото", callback_data="photo_ai")],
-            [InlineKeyboardButton(text="🎨 Анимирование картины", callback_data="animation")],
+            [InlineKeyboardButton(text="📹 Создать видео", callback_data="video")],
+            [InlineKeyboardButton(text="🎨 Анимировать картину", callback_data="animation")],
             [InlineKeyboardButton(text="🖼️ Редактировать фото", callback_data="photo")],
         ]
     )
@@ -69,10 +67,9 @@ async def back_to_menu(callback: types.CallbackQuery, state: FSMContext):
 async def cmd_help(message: types.Message):
     """Обработчик команды /help"""
     help_text = """
-**📹 Текст → Видео** - Генерируй видео из текста (разбивается на сцены)
-**📸 Текст → Фото** - Генерируй фотографии из текста (с наследованием от предыдущих)
-**🎨 Анимирование картины** - Оживи картину с помощью AI (одно видео)
-**🖼️ Редактировать фото** - Базовое редактирование фото
+📹 **Создать видео** - Генерируй видео из текста через AI
+🎨 **Анимировать картину** - Оживи картину с помощью AI
+🖼️ **Редактировать фото** - Редактируй и обрабатывай фото
 
 Используй /start для главного меню
     """
