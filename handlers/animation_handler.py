@@ -1,12 +1,54 @@
 """Обработчик для анимирования картин"""
 import logging
+import asyncio
 from aiogram import Router, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from openai import AsyncOpenAI
+from config import OPENAI_API_KEY
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+async def enhance_animation_prompt(prompt: str) -> str:
+    """Улучшает промт для анимирования видео через OpenAI GPT-4"""
+    if not OPENAI_API_KEY:
+        logger.warning("⚠️ OPENAI_API_KEY не найден, возвращаю оригинальный промт")
+        return prompt
+    
+    try:
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        
+        system_prompt = """Ты эксперт по созданию видео промтов для AI моделей видеогенерации (Kling, Sora, Veo).
+Твоя задача - улучшить промт пользователя, добавив:
+1. Больше деталей о движении камеры и динамике
+2. Уточнение атмосферы и стиля (кинематография, освещение)
+3. Детали персонажей/объектов
+4. Временные параметры (день/ночь, погода)
+5. Конкретные эффекты и переходы
+
+Верни ТОЛЬКО улучшенный промт (на русском языке), без объяснений. Длина: 200-300 символов."""
+        
+        response = await client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Улучши этот промт для видео:\n{prompt}"}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        enhanced = response.choices[0].message.content.strip()
+        logger.info(f"✅ Промт улучшен:\nОригинал: {prompt}\nУлучшенный: {enhanced}")
+        return enhanced
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при улучшении промта: {e}")
+        logger.warning(f"⚠️ Возвращаю оригинальный промт")
+        return prompt
 
 
 class AnimationStates(StatesGroup):
@@ -279,15 +321,28 @@ async def enhance_prompt_yes(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AnimationStates.generating)
     
     data = await state.get_data()
+    original_prompt = data.get("prompt", "")
     
-    await callback.message.answer(
+    msg = await callback.message.answer(
         f"✨ Улучшаю промт через ИИ...\n"
         f"⏳ Это займет несколько секунд..."
     )
     
-    # TODO: Добавить улучшение промта через GPT/Gemini
-    original_prompt = data.get("prompt", "")
-    enhanced_prompt = original_prompt  # TODO: заменить на реальное улучшение
+    # Улучшаем промт через OpenAI GPT-4
+    enhanced_prompt = await enhance_animation_prompt(original_prompt)
+    
+    # Показываем результат улучшения
+    if enhanced_prompt != original_prompt:
+        await callback.message.answer(
+            f"✅ Промт улучшен!\n\n"
+            f"📝 <b>Оригинал:</b>\n{original_prompt}\n\n"
+            f"✨ <b>Улучшенный:</b>\n{enhanced_prompt}",
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.answer(
+            f"⚠️ Не удалось улучшить промт через ИИ, использую оригинальный"
+        )
     
     await state.update_data(prompt=enhanced_prompt)
     await start_generation(callback, state)
