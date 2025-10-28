@@ -1,25 +1,25 @@
 """Обработчик для анимирования картин"""
 import logging
 import asyncio
+import google.generativeai as genai
 from aiogram import Router, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from openai import AsyncOpenAI
-from config import OPENAI_API_KEY
+from config import GEMINI_API_KEY
 
 logger = logging.getLogger(__name__)
 router = Router()
 
 
 async def enhance_animation_prompt(prompt: str) -> str:
-    """Улучшает промт для анимирования видео через OpenAI GPT-4"""
-    if not OPENAI_API_KEY:
-        logger.warning("⚠️ OPENAI_API_KEY не найден, возвращаю оригинальный промт")
+    """Улучшает промт для анимирования видео через Google Gemini"""
+    if not GEMINI_API_KEY:
+        logger.warning("⚠️ GEMINI_API_KEY не найден, возвращаю оригинальный промт")
         return prompt
     
     try:
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        genai.configure(api_key=GEMINI_API_KEY)
         
         system_prompt = """Ты эксперт по созданию видео промтов для AI моделей видеогенерации (Kling, Sora, Veo).
 Твоя задача - улучшить промт пользователя, добавив:
@@ -31,22 +31,18 @@ async def enhance_animation_prompt(prompt: str) -> str:
 
 Верни ТОЛЬКО улучшенный промт (на русском языке), без объяснений. Длина: 200-300 символов."""
         
-        response = await client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Улучши этот промт для видео:\n{prompt}"}
-            ],
-            temperature=0.7,
-            max_tokens=500
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = await asyncio.to_thread(
+            model.generate_content,
+            f"{system_prompt}\n\nУлучши этот промт для видео:\n{prompt}"
         )
         
-        enhanced = response.choices[0].message.content.strip()
-        logger.info(f"✅ Промт улучшен:\nОригинал: {prompt}\nУлучшенный: {enhanced}")
+        enhanced = response.text.strip()
+        logger.info(f"✅ Промт улучшен Gemini:\nОригинал: {prompt}\nУлучшенный: {enhanced}")
         return enhanced
         
     except Exception as e:
-        logger.error(f"❌ Ошибка при улучшении промта: {e}")
+        logger.error(f"❌ Ошибка при улучшении промта Gemini: {e}")
         logger.warning(f"⚠️ Возвращаю оригинальный промт")
         return prompt
 
@@ -328,7 +324,7 @@ async def enhance_prompt_yes(callback: types.CallbackQuery, state: FSMContext):
         f"⏳ Это займет несколько секунд..."
     )
     
-    # Улучшаем промт через OpenAI GPT-4
+    # Улучшаем промт через Google Gemini
     enhanced_prompt = await enhance_animation_prompt(original_prompt)
     
     # Показываем результат улучшения
