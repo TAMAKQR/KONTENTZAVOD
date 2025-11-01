@@ -2,14 +2,23 @@
 import asyncio
 import json
 import logging
+import uuid
+import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 from aiogram import Router, types, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import StateFilter
-from video_generator import VideoGenerator
-from video_stitcher import VideoStitcher
-from image_utils import ImageUploader
+from generators.video_generator import VideoGenerator
+from generators.video_stitcher import VideoStitcher
+from generators.image_utils import ImageUploader
+from integrations.airtable.airtable_logger import session_logger
+from integrations.airtable.airtable_video_update import update_video_parameters
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -22,8 +31,9 @@ class VideoStates(StatesGroup):
     # Подпоток 1: Текст → Видео
     text_choosing_model = State()  # Выбор модели AI
     text_choosing_aspect_ratio = State()  # Выбор соотношения сторон
+    text_choosing_duration = State()  # Выбор длительности
     text_waiting_prompt = State()  # Ввод промта
-    text_processing_prompt = State()  # GPT обработка промта
+    text_processing_prompt = State()  # Gemini обработка промта
     text_confirming_scenes = State()  # Подтверждение сцен
     text_editing_scene = State()  # Редактирование отдельной сцены
     text_generating = State()  # Генерация видео
@@ -31,6 +41,7 @@ class VideoStates(StatesGroup):
     # Подпоток 2: Текст + Фото → Видео
     text_photo_choosing_model = State()  # Выбор модели AI
     text_photo_choosing_aspect_ratio = State()  # Выбор соотношения сторон
+    text_photo_choosing_duration = State()  # Выбор длительности
     text_photo_waiting_prompt = State()
     text_photo_waiting_photo = State()
     text_photo_confirming_scene_photo = State()  # Подтверждение фото для каждой сцены
@@ -41,14 +52,24 @@ class VideoStates(StatesGroup):
     # Подпоток 3: Текст + Фото + AI → Видео
     text_photo_ai_choosing_model = State()  # Выбор модели (kling-v2.5-turbo-pro)
     text_photo_ai_choosing_aspect_ratio = State()  # Выбор соотношения сторон
+    text_photo_ai_choosing_duration = State()  # Выбор длительности
     text_photo_ai_asking_reference = State()  # Вопрос о референсе
     text_photo_ai_waiting_reference = State()  # Загрузка референса
     text_photo_ai_waiting_prompt = State()  # Ввод промта
-    text_photo_ai_processing_prompt = State()  # GPT разбивает на сцены
+    text_photo_ai_processing_prompt = State()  # Gemini разбивает на сцены
     text_photo_ai_generating_photos = State()  # Генерация фото через google/nano-banana
     text_photo_ai_confirming_scenes = State()  # Подтверждение сцен с фото
     text_photo_ai_editing_scene = State()  # Редактирование сцены
     text_photo_ai_generating = State()  # Генерация видео
+
+
+def get_video_type_buttons():
+    """Получить кнопки выбора типа видео"""
+    return [
+        {"id": 1, "text": "📝 Текст", "callback": "video_text"},
+        {"id": 2, "text": "📝 Текст + Фото", "callback": "video_text_photo"},
+        {"id": 3, "text": "📝 Текст + Фото + AI", "callback": "video_text_photo_ai"}
+    ]
 
 
 @router.callback_query(lambda c: c.data == "video")
@@ -57,14 +78,20 @@ async def start_video_creation(callback: types.CallbackQuery, state: FSMContext)
     await callback.answer()
     await state.set_state(VideoStates.choosing_type)
     
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📝 Текст", callback_data="video_text")],
-            [InlineKeyboardButton(text="📝 Текст + Фото", callback_data="video_text_photo")],
-            [InlineKeyboardButton(text="📝 Текст + Фото + AI", callback_data="video_text_photo_ai")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]
-        ]
-    )
+    # Загружаем кнопки из БД
+    buttons = get_video_type_buttons()
+    
+    # Создаём клавиатуру
+    inline_keyboard = []
+    for btn in buttons:
+        inline_keyboard.append([
+            InlineKeyboardButton(text=btn["text"], callback_data=btn["callback"])
+        ])
+    
+    # Добавляем кнопку "Назад"
+    inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
     
     await callback.message.answer(
         "📹 Создание видео\n\n"
@@ -78,21 +105,66 @@ async def start_video_creation(callback: types.CallbackQuery, state: FSMContext)
 @router.callback_query(lambda c: c.data == "video_text")
 async def start_text_video(callback: types.CallbackQuery, state: FSMContext):
     """Режим 1: Только текст - выбор модели AI"""
+    from src.workflow_tracker import WorkflowTracker
+    
     await callback.answer()
+    
+    # 🔄 Создание workflow для генерации видео
+    user_id = callback.from_user.id
+    session_id = f"video_{uuid.uuid4().hex[:12]}"
+    start_time = time.time()
+    
+    tracker = WorkflowTracker()
+    
+    # Определение этапов workflow
+    stages = [
+        {"id": 1, "title": "⚙️ Выбор модели", "description": "Выбор AI модели для генерации"},
+        {"id": 2, "title": "📐 Настройка параметров", "description": "Соотношение сторон, качество"},
+        {"id": 3, "title": "✍️ Написание промпта", "description": "Описание желаемого видео"},
+        {"id": 4, "title": "🤖 Обработка Gemini", "description": "Разбиение на сцены через AI"},
+        {"id": 5, "title": "✅ Подтверждение сцен", "description": "Проверка и редактирование сцен"},
+        {"id": 6, "title": "🎬 Генерация сцен", "description": "Создание видео через Replicate API"},
+        {"id": 7, "title": "🎞️ Склеивание видео", "description": "Объединение всех сцен в одно видео"},
+        {"id": 8, "title": "📤 Отправка результата", "description": "Доставка видео в Telegram"}
+    ]
+    
+    # Запуск workflow
+    workflow_id = tracker.start_workflow(user_id, "📹 Создание видео (Текст)", stages)
+    
+    # 📊 Логирование в Airtable
+    await session_logger.log_session_start(
+        user_id=user_id,
+        session_id=session_id,
+        video_type="text"
+    )
+    
+    await state.update_data(workflow_id=workflow_id, session_id=session_id, start_time=start_time, video_type="text")
+    
+    # Первый этап - выбор модели
+    tracker.update_stage(workflow_id, 1, "running", {"step": "Выбор AI модели"})
+    
     await state.set_state(VideoStates.text_choosing_model)
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎬 Kling v2.5 Turbo Pro", callback_data="model_kling_text")],
-            [InlineKeyboardButton(text="🎞️ Sora 2", callback_data="model_sora_text")],
             [InlineKeyboardButton(text="🎥 Veo 3.1 Fast", callback_data="model_veo_text")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]
         ]
     )
     
     await callback.message.answer(
-        "📝 Режим: Текст → Видео\n\n"
-        "Выбери AI модель для генерации:",
+        "📝 Режим: Текст → Видео\n"
+        "────────────────────────────────────\n\n"
+        "Выбери AI модель для генерации:\n\n"
+        "🎬 <b>Kling v2.5 Turbo Pro</b>\n"
+        "   💰 $0.07/сек (~$0.70 за 10 сек)\n"
+        "   ⭐ Бюджетный вариант\n\n"
+        "🎥 <b>Veo 3.1 Fast</b>\n"
+        "   💰 $0.15/сек (~$1.20 за 8 сек)\n"
+        "   ⭐ Лучшее качество\n\n"
+        "📊 <b>Следи за процессом:</b> http://localhost:3000/workflow",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
@@ -100,22 +172,37 @@ async def start_text_video(callback: types.CallbackQuery, state: FSMContext):
 @router.callback_query(lambda c: c.data.startswith("model_") and c.data.endswith("_text"))
 async def choose_text_model(callback: types.CallbackQuery, state: FSMContext):
     """Выбор модели для режима Текст"""
+    from src.workflow_tracker import WorkflowTracker
+    
     await callback.answer()
     
     model_map = {
         "model_kling_text": ("kling", "kwaivgi/kling-v2.5-turbo-pro"),
-        "model_sora_text": ("sora", "openai/sora-2"),
         "model_veo_text": ("veo", "google/veo-3.1-fast")
     }
     
     model_key, model_full = model_map.get(callback.data, ("kling", "kwaivgi/kling-v2.5-turbo-pro"))
     await state.update_data(model_key=model_key, model=model_full)
+    
+    # Обновление workflow - завершение этапа 1, начало этапа 2
+    data = await state.get_data()
+    workflow_id = data.get("workflow_id")
+    session_id = data.get("session_id")
+    
+    if workflow_id:
+        tracker = WorkflowTracker()
+        tracker.update_stage(workflow_id, 1, "completed", {"model": model_key})
+        tracker.update_stage(workflow_id, 2, "running", {"step": "Выбор соотношения сторон"})
+    
+    if session_id:
+        model_for_airtable = "Kling" if model_key == "kling" else "Veo"
+        await update_video_parameters(session_id, model=model_for_airtable)
+    
     await state.set_state(VideoStates.text_choosing_aspect_ratio)
     
     model_names = {
         "kling": "🎬 Kling v2.5 Turbo Pro (5/10 сек)",
-        "sora": "🎞️ Sora 2 (20 сек)",
-        "veo": "🎥 Veo 3.1 Fast (5/10/15 сек)"
+        "veo": "🎥 Veo 3.1 Fast (4/6/8 сек)"
     }
     
     keyboard = InlineKeyboardMarkup(
@@ -141,6 +228,8 @@ async def choose_text_model(callback: types.CallbackQuery, state: FSMContext):
 @router.callback_query(lambda c: c.data.startswith("aspect_") and c.data.endswith("_text") and not c.data.endswith("_text_photo"))
 async def choose_text_aspect_ratio(callback: types.CallbackQuery, state: FSMContext):
     """Выбор соотношения сторон для режима Текст"""
+    from src.workflow_tracker import WorkflowTracker
+    
     await callback.answer()
     
     aspect_map = {
@@ -151,6 +240,31 @@ async def choose_text_aspect_ratio(callback: types.CallbackQuery, state: FSMCont
     
     aspect_ratio = aspect_map.get(callback.data, "16:9")
     await state.update_data(aspect_ratio=aspect_ratio)
+    
+    data = await state.get_data()
+    model_key = data.get("model_key", "kling")
+    
+    # Автоматически устанавливаем минимальную длительность в зависимости от модели
+    if model_key == "kling":
+        duration = 5
+    else:  # veo
+        duration = 4
+    
+    await state.update_data(duration_per_scene=duration)
+    
+    # Обновление workflow - завершение этапа 2 и 3, начало этапа 4
+    workflow_id = data.get("workflow_id")
+    session_id = data.get("session_id")
+    
+    if workflow_id:
+        tracker = WorkflowTracker()
+        tracker.update_stage(workflow_id, 2, "completed", {"aspect_ratio": aspect_ratio})
+        tracker.update_stage(workflow_id, 3, "completed", {"duration": duration})
+        tracker.update_stage(workflow_id, 4, "running", {"step": "Ожидание промпта от пользователя"})
+    
+    if session_id:
+        await update_video_parameters(session_id, aspect_ratio=aspect_ratio, duration=duration)
+    
     await state.set_state(VideoStates.text_waiting_prompt)
     
     aspect_names = {
@@ -159,20 +273,60 @@ async def choose_text_aspect_ratio(callback: types.CallbackQuery, state: FSMCont
         "1:1": "⬜ 1:1 (Квадратное)"
     }
     
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]]
+    )
+    
+    await callback.message.answer(
+        f"✅ Параметры видео:\n"
+        f"{'═' * 40}\n\n"
+        f"🎬 Модель: {model_key.upper()}\n"
+        f"📐 Соотношение: {aspect_names.get(aspect_ratio, aspect_ratio)}\n"
+        f"⏱️  Длительность: <b>{duration} сек</b>\n\n"
+        f"{'═' * 40}\n"
+        f"📝 Теперь напиши описание видео:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(lambda c: c.data.startswith("duration_") and c.data.endswith("_text"))
+async def choose_text_duration(callback: types.CallbackQuery, state: FSMContext):
+    """Выбор длительности для режима Текст"""
+    from src.workflow_tracker import WorkflowTracker
+    
+    await callback.answer()
+    
+    duration_map = {
+        "duration_4_text": 4,
+        "duration_5_text": 5,
+        "duration_6_text": 6,
+        "duration_8_text": 8,
+        "duration_10_text": 10,
+    }
+    
+    duration = duration_map.get(callback.data, 5)
+    await state.update_data(duration_per_scene=duration)
+    
+    # Обновление workflow
     data = await state.get_data()
-    model_key = data.get("model_key", "kling")
+    workflow_id = data.get("workflow_id")
+    if workflow_id:
+        tracker = WorkflowTracker()
+        tracker.update_stage(workflow_id, 3, "completed", {"duration": duration})
+        tracker.update_stage(workflow_id, 4, "running", {"step": "Ожидание промпта от пользователя"})
+    
+    await state.set_state(VideoStates.text_waiting_prompt)
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]]
     )
     
     await callback.message.answer(
-        f"✅ Параметры видео установлены:\n"
+        f"✅ Длительность выбрана: <b>{duration} сек</b>\n"
         f"{'═' * 40}\n\n"
-        f"🎬 Модель: {model_key.upper()}\n"
-        f"📐 Соотношение: {aspect_names.get(aspect_ratio, aspect_ratio)}\n\n"
-        f"{'═' * 40}\n"
         f"📝 Теперь напиши описание видео:",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
@@ -202,12 +356,25 @@ def extract_num_scenes_from_prompt(prompt: str) -> int:
 
 @router.message(VideoStates.text_waiting_prompt)
 async def process_text_video_prompt(message: types.Message, state: FSMContext):
-    """Обработка текста для видео - отправка на обработку GPT"""
+    """Обработка текста для видео - отправка на обработку Gemini"""
+    from src.workflow_tracker import WorkflowTracker
+    
     data = await state.get_data()
     model_key = data.get("model_key", "kling")
+    workflow_id = data.get("workflow_id")
+    session_id = data.get("session_id")
     
     await state.update_data(prompt=message.text)
     await state.set_state(VideoStates.text_processing_prompt)
+    
+    # Обновление workflow - завершение этапа 3, начало этапа 4
+    if workflow_id:
+        tracker = WorkflowTracker()
+        tracker.update_stage(workflow_id, 3, "completed", {"prompt_length": len(message.text)})
+        tracker.update_stage(workflow_id, 4, "running", {"step": "Обработка через Gemini AI"})
+    
+    if session_id:
+        await update_video_parameters(session_id, prompt=message.text[:500])
     
     input_text = message.text
     indented_input = "\n".join("    " + line for line in input_text.split("\n"))
@@ -215,7 +382,7 @@ async def process_text_video_prompt(message: types.Message, state: FSMContext):
     num_scenes = extract_num_scenes_from_prompt(message.text)
     
     processing_msg = await message.answer(
-        f"⏳ Обработка промта через GPT-4...\n"
+        f"⏳ Обработка промта через Gemini AI...\n"
         f"{'─' * 40}\n\n"
         f"📝 Ваш промт:\n\n{indented_input}\n\n"
         f"{'─' * 40}\n"
@@ -225,7 +392,7 @@ async def process_text_video_prompt(message: types.Message, state: FSMContext):
     try:
         generator = VideoGenerator()
         
-        scenes_result = await generator.enhance_prompt_with_gpt(
+        scenes_result = await generator.enhance_prompt_with_gemini(
             prompt=message.text,
             num_scenes=num_scenes
         )
@@ -236,12 +403,27 @@ async def process_text_video_prompt(message: types.Message, state: FSMContext):
             current_scene_index=0
         )
         
+        # Обновление workflow - завершение этапа 4, начало этапа 5
+        if workflow_id:
+            tracker = WorkflowTracker()
+            tracker.update_stage(workflow_id, 4, "completed", {
+                "num_scenes": len(scenes_result["scenes"]),
+                "enhanced_prompt": scenes_result["enhanced_prompt"][:100]
+            })
+            tracker.update_stage(workflow_id, 5, "running", {"step": "Подтверждение сцен"})
+        
         await state.set_state(VideoStates.text_confirming_scenes)
         
         await show_scene_for_confirmation(message, state, 0)
         
     except Exception as e:
         logger.error(f"❌ Ошибка обработки: {e}")
+        
+        # Ошибка в workflow
+        if workflow_id:
+            tracker = WorkflowTracker()
+            tracker.error_workflow(workflow_id, f"Ошибка Gemini: {str(e)}", 4)
+        
         await processing_msg.edit_text(
             f"❌ Ошибка при обработке: {str(e)}\n\n"
             f"Попробуй еще раз с /start"
@@ -380,7 +562,7 @@ async def regenerate_all_scenes(callback: types.CallbackQuery, state: FSMContext
         generator = VideoGenerator()
         num_scenes = extract_num_scenes_from_prompt(prompt)
         
-        scenes_result = await generator.enhance_prompt_with_gpt(
+        scenes_result = await generator.enhance_prompt_with_gemini(
             prompt=prompt,
             num_scenes=num_scenes
         )
@@ -402,12 +584,47 @@ async def regenerate_all_scenes(callback: types.CallbackQuery, state: FSMContext
 
 async def start_video_generation(message: types.Message, state: FSMContext):
     """Начинает генерацию видео всех сцен"""
+    from src.workflow_tracker import WorkflowTracker
+    
     await state.set_state(VideoStates.text_generating)
     
     data = await state.get_data()
     scenes = data.get("scenes", [])
     model_key = data.get("model_key", "kling")
     aspect_ratio = data.get("aspect_ratio", "16:9")
+    workflow_id = data.get("workflow_id")
+    session_id = data.get("session_id")
+    prompt = data.get("prompt", "")
+    duration = data.get("duration", 5)
+    
+    # 📊 Логирование параметров генерации в Airtable
+    if session_id:
+        data = await state.get_data()
+        video_type = data.get("video_type")
+        enhanced_prompt = data.get("enhanced_prompt", "")
+        prompt_data = {"enhanced_prompt": enhanced_prompt, "scenes": scenes}
+        scenes_json = json.dumps(prompt_data, ensure_ascii=False, indent=2)[:2000]
+        
+        await session_logger.log_session_update(
+            session_id=session_id,
+            update_fields={
+                "Model": model_key.capitalize(),
+                "Aspect Ratio": aspect_ratio,
+                "Duration": int(duration),
+                "PromptAI": scenes_json,
+                "Status": "Generating"
+            },
+            video_type=video_type
+        )
+    
+    # Обновление workflow - завершение этапа 5, начало этапа 6
+    if workflow_id:
+        tracker = WorkflowTracker()
+        tracker.update_stage(workflow_id, 5, "completed", {"all_scenes_confirmed": True})
+        tracker.update_stage(workflow_id, 6, "running", {
+            "step": "Генерация сцен через Replicate API",
+            "num_scenes": len(scenes)
+        })
     
     for scene in scenes:
         scene["aspect_ratio"] = aspect_ratio
@@ -432,6 +649,13 @@ async def start_video_generation(message: types.Message, state: FSMContext):
     try:
         generator = VideoGenerator()
         stitcher = VideoStitcher()
+        
+        if session_id:
+            await session_logger.log_session_update(
+                session_id=session_id,
+                video_type=video_type,
+                update_fields={"Status": "Processing"}
+            )
         
         logger.info(f"🎬 Генерирую {len(scenes)} сцен ПАРАЛЛЕЛЬНО через {model_key}...")
         await generating_msg.edit_text(
@@ -507,6 +731,31 @@ async def start_video_generation(message: types.Message, state: FSMContext):
         if not video_paths:
             raise Exception(f"Не удалось скачать ни одного видео из {len(scene_results)} сцен")
         
+        # 📊 Логирование URL видео сцен в Airtable
+        scene_videos_list = []
+        for i, result in enumerate(scene_results):
+            if result.get("status") == "success":
+                scene_videos_list.append({
+                    "scene": i + 1,
+                    "url": result.get("video_url", "")
+                })
+        
+        if session_id and scene_videos_list:
+            await session_logger.log_scene_artifacts(
+                session_id=session_id,
+                video_type=video_type,
+                scene_videos=scene_videos_list
+            )
+        
+        # Обновление workflow - завершение этапа 6, начало этапа 7
+        if workflow_id:
+            tracker = WorkflowTracker()
+            tracker.update_stage(workflow_id, 6, "completed", {
+                "scenes_generated": len(video_paths),
+                "total_scenes": len(scene_results)
+            })
+            tracker.update_stage(workflow_id, 7, "running", {"step": "Склеивание видео"})
+        
         await generating_msg.edit_text(
             "🎬 Объединяю видео с плавными переходами...\n\n"
             "⏳ Это займет пару минут..."
@@ -521,17 +770,64 @@ async def start_video_generation(message: types.Message, state: FSMContext):
         if not final_video_path:
             raise Exception("Не удалось объединить видео")
         
+        # Обновление workflow - завершение этапа 7, начало этапа 8
+        if workflow_id:
+            tracker = WorkflowTracker()
+            tracker.update_stage(workflow_id, 7, "completed", {"final_video": final_video_path})
+            tracker.update_stage(workflow_id, 8, "running", {"step": "Отправка в Telegram"})
+        
         await generating_msg.delete()
         await message.answer_video(
             types.FSInputFile(final_video_path),
             caption="✅ Видео готово!\n\n🎬 С плавными переходами 0.5 сек"
         )
         
+        # Завершение workflow - успешно
+        if workflow_id:
+            tracker = WorkflowTracker()
+            tracker.update_stage(workflow_id, 8, "completed", {"delivered": True})
+            tracker.complete_workflow(workflow_id, final_video_path)
+        
+        # 📊 Логирование успешного завершения в Airtable
+        data = await state.get_data()
+        session_id = data.get("session_id")
+        start_time = data.get("start_time")
+        video_type = data.get("video_type")
+        if session_id and start_time:
+            processing_time = time.time() - start_time
+            await session_logger.log_session_complete(
+                session_id=session_id,
+                video_type=video_type,
+                status="Completed",
+                output_url=final_video_path,
+                processing_time=processing_time
+            )
+        
         await stitcher.cleanup_temp_files()
         logger.info("✅ Генерация завершена успешно")
         
     except Exception as e:
         logger.error(f"❌ Ошибка генерации: {e}")
+        
+        # Ошибка в workflow
+        if workflow_id:
+            tracker = WorkflowTracker()
+            tracker.error_workflow(workflow_id, f"Ошибка генерации: {str(e)}", 6)
+        
+        # 📊 Логирование ошибки в Airtable
+        data = await state.get_data()
+        session_id = data.get("session_id")
+        video_type = data.get("video_type")
+        if session_id:
+            await session_logger.log_session_update(
+                session_id=session_id,
+                video_type=video_type,
+                update_fields={
+                    "Status": "Failed",
+                    "Error Message": str(e)[:500]
+                }
+            )
+        
         await generating_msg.edit_text(
             f"❌ Ошибка при генерации видео:\n\n`{str(e)}`\n\n"
             f"Попробуй еще раз с /start",
@@ -547,21 +843,66 @@ async def start_video_generation(message: types.Message, state: FSMContext):
 @router.callback_query(lambda c: c.data == "video_text_photo")
 async def start_text_photo_video(callback: types.CallbackQuery, state: FSMContext):
     """Режим 2: Текст + Фото - выбор модели AI"""
+    from src.workflow_tracker import WorkflowTracker
+    
     await callback.answer()
+    
+    # 🔄 Создание workflow для режима Текст + Фото
+    user_id = callback.from_user.id
+    session_id = f"video_{uuid.uuid4().hex[:12]}"
+    start_time = time.time()
+    
+    tracker = WorkflowTracker()
+    
+    # Определение этапов workflow
+    stages = [
+        {"id": 1, "title": "⚙️ Выбор модели", "description": "Выбор AI модели для генерации"},
+        {"id": 2, "title": "📐 Настройка параметров", "description": "Соотношение сторон, качество"},
+        {"id": 3, "title": "✍️ Написание промпта", "description": "Описание желаемого видео"},
+        {"id": 4, "title": "📸 Загрузка фото", "description": "Загрузка изображений для сцен"},
+        {"id": 5, "title": "✅ Подтверждение сцен", "description": "Проверка и редактирование сцен"},
+        {"id": 6, "title": "🎬 Генерация сцен", "description": "Создание видео через Replicate API"},
+        {"id": 7, "title": "🎞️ Склеивание видео", "description": "Объединение всех сцен в одно видео"},
+        {"id": 8, "title": "📤 Отправка результата", "description": "Доставка видео в Telegram"}
+    ]
+    
+    # Запуск workflow
+    workflow_id = tracker.start_workflow(user_id, "📹 Создание видео (Текст + Фото)", stages)
+    
+    # 📊 Логирование в Airtable
+    await session_logger.log_session_start(
+        user_id=user_id,
+        session_id=session_id,
+        video_type="text_photo"
+    )
+    
+    await state.update_data(workflow_id=workflow_id, session_id=session_id, start_time=start_time, video_type="text_photo")
+    
+    # Первый этап - выбор модели
+    tracker.update_stage(workflow_id, 1, "running", {"step": "Выбор AI модели"})
+    
     await state.set_state(VideoStates.text_photo_choosing_model)
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎬 Kling v2.5 Turbo Pro", callback_data="model_kling_text_photo")],
-            [InlineKeyboardButton(text="🎞️ Sora 2", callback_data="model_sora_text_photo")],
             [InlineKeyboardButton(text="🎥 Veo 3.1 Fast", callback_data="model_veo_text_photo")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]
         ]
     )
     
     await callback.message.answer(
-        "📝🖼️ Режим: Текст + Фото → Видео\n\n"
-        "Выбери AI модель для генерации:",
+        "📝🖼️ Режим: Текст + Фото → Видео\n"
+        "────────────────────────────────────\n\n"
+        "Выбери AI модель для генерации:\n\n"
+        "🎬 <b>Kling v2.5 Turbo Pro</b>\n"
+        "   💰 $0.07/сек (~$0.70 за 10 сек)\n"
+        "   ⭐ Бюджетный вариант\n\n"
+        "🎥 <b>Veo 3.1 Fast</b>\n"
+        "   💰 $0.15/сек (~$1.20 за 8 сек)\n"
+        "   ⭐ Лучшее качество\n\n"
+        "📊 <b>Следи за процессом:</b> http://localhost:3000/workflow",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
@@ -573,18 +914,24 @@ async def choose_text_photo_model(callback: types.CallbackQuery, state: FSMConte
     
     model_map = {
         "model_kling_text_photo": ("kling", "kwaivgi/kling-v2.5-turbo-pro"),
-        "model_sora_text_photo": ("sora", "openai/sora-2"),
         "model_veo_text_photo": ("veo", "google/veo-3.1-fast")
     }
     
     model_key, model_full = model_map.get(callback.data, ("kling", "kwaivgi/kling-v2.5-turbo-pro"))
     await state.update_data(model_key=model_key, model=model_full)
+    
+    data = await state.get_data()
+    session_id = data.get("session_id")
+    
+    if session_id:
+        model_for_airtable = "Kling" if model_key == "kling" else "Veo"
+        await update_video_parameters(session_id, model=model_for_airtable)
+    
     await state.set_state(VideoStates.text_photo_choosing_aspect_ratio)
     
     model_names = {
         "kling": "🎬 Kling v2.5 Turbo Pro (5/10 сек)",
-        "sora": "🎞️ Sora 2 (20 сек)",
-        "veo": "🎥 Veo 3.1 Fast (5/10/15 сек)"
+        "veo": "🎥 Veo 3.1 Fast (4/6/8 сек)"
     }
     
     keyboard = InlineKeyboardMarkup(
@@ -620,6 +967,22 @@ async def choose_text_photo_aspect_ratio(callback: types.CallbackQuery, state: F
     
     aspect_ratio = aspect_map.get(callback.data, "16:9")
     await state.update_data(aspect_ratio=aspect_ratio)
+    
+    data = await state.get_data()
+    model_key = data.get("model_key", "kling")
+    session_id = data.get("session_id")
+    
+    # Автоматически устанавливаем минимальную длительность в зависимости от модели
+    if model_key == "kling":
+        duration = 5
+    else:  # veo
+        duration = 4
+    
+    await state.update_data(duration_per_scene=duration)
+    
+    if session_id:
+        await update_video_parameters(session_id, aspect_ratio=aspect_ratio, duration=duration)
+    
     await state.set_state(VideoStates.text_photo_waiting_prompt)
     
     aspect_names = {
@@ -628,20 +991,49 @@ async def choose_text_photo_aspect_ratio(callback: types.CallbackQuery, state: F
         "1:1": "⬜ 1:1 (Квадратное)"
     }
     
-    data = await state.get_data()
-    model_key = data.get("model_key", "kling")
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]]
+    )
+    
+    await callback.message.answer(
+        f"✅ Параметры видео:\n"
+        f"{'═' * 40}\n\n"
+        f"🎬 Модель: {model_key.upper()}\n"
+        f"📐 Соотношение: {aspect_names.get(aspect_ratio, aspect_ratio)}\n"
+        f"⏱️  Длительность: <b>{duration} сек</b>\n\n"
+        f"{'═' * 40}\n"
+        f"📝 Теперь напиши описание видео:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(lambda c: c.data.startswith("duration_") and c.data.endswith("_text_photo"))
+async def choose_text_photo_duration(callback: types.CallbackQuery, state: FSMContext):
+    """Выбор длительности для режима Текст+Фото"""
+    await callback.answer()
+    
+    duration_map = {
+        "duration_4_text_photo": 4,
+        "duration_5_text_photo": 5,
+        "duration_6_text_photo": 6,
+        "duration_8_text_photo": 8,
+        "duration_10_text_photo": 10,
+    }
+    
+    duration = duration_map.get(callback.data, 5)
+    await state.update_data(duration_per_scene=duration)
+    await state.set_state(VideoStates.text_photo_waiting_prompt)
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]]
     )
     
     await callback.message.answer(
-        f"✅ Параметры видео установлены:\n"
+        f"✅ Длительность выбрана: <b>{duration} сек</b>\n"
         f"{'═' * 40}\n\n"
-        f"🎬 Модель: {model_key.upper()}\n"
-        f"📐 Соотношение: {aspect_names.get(aspect_ratio, aspect_ratio)}\n\n"
-        f"{'═' * 40}\n"
         f"📝 Теперь напиши описание видео:",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
@@ -649,11 +1041,26 @@ async def choose_text_photo_aspect_ratio(callback: types.CallbackQuery, state: F
 @router.message(VideoStates.text_photo_waiting_prompt)
 async def process_text_photo_prompt(message: types.Message, state: FSMContext):
     """Обработка текста для видео (Текст+Фото режим)"""
+    from integrations.airtable.airtable_video_update import update_video_parameters
+    
     data = await state.get_data()
     model_key = data.get("model_key", "kling")
+    session_id = data.get("session_id")
+    aspect_ratio = data.get("aspect_ratio", "16:9")
+    duration = data.get("duration_per_scene", 5)
     
     await state.update_data(prompt=message.text)
     await state.set_state(VideoStates.text_processing_prompt)
+    
+    if session_id:
+        model_for_airtable = "Kling" if model_key == "kling" else "Veo"
+        await update_video_parameters(
+            session_id, 
+            model=model_for_airtable,
+            aspect_ratio=aspect_ratio,
+            duration=int(duration),
+            prompt=message.text[:500]
+        )
     
     input_text = message.text
     indented_input = "\n".join("    " + line for line in input_text.split("\n"))
@@ -661,7 +1068,7 @@ async def process_text_photo_prompt(message: types.Message, state: FSMContext):
     num_scenes = extract_num_scenes_from_prompt(message.text)
     
     processing_msg = await message.answer(
-        f"⏳ Обработка промта через GPT-4...\n"
+        f"⏳ Обработка промта через Gemini AI...\n"
         f"{'─' * 40}\n\n"
         f"📝 Ваш промт:\n\n{indented_input}\n\n"
         f"{'─' * 40}\n"
@@ -671,7 +1078,7 @@ async def process_text_photo_prompt(message: types.Message, state: FSMContext):
     try:
         generator = VideoGenerator()
         
-        scenes_result = await generator.enhance_prompt_with_gpt(
+        scenes_result = await generator.enhance_prompt_with_gemini(
             prompt=message.text,
             num_scenes=num_scenes
         )
@@ -813,6 +1220,28 @@ async def start_text_photo_video_generation(message: types.Message, state: FSMCo
         generator = VideoGenerator()
         stitcher = VideoStitcher()
         
+        # 📊 Логирование параметров генерации в Airtable
+        session_id = data.get("session_id")
+        video_type = data.get("video_type")
+        prompt = data.get("prompt", "")
+        duration = data.get("duration_per_scene", 5)
+        
+        if session_id:
+            enhanced_prompt = data.get("enhanced_prompt", "")
+            prompt_data = {"enhanced_prompt": enhanced_prompt, "scenes": scenes}
+            scenes_json = json.dumps(prompt_data, ensure_ascii=False, indent=2)[:2000]
+            await session_logger.log_session_update(
+                session_id=session_id,
+                video_type=video_type,
+                update_fields={
+                    "Model": model_key.capitalize(),
+                    "Aspect Ratio": aspect_ratio,
+                    "Duration": int(duration),
+                    "PromptAI": scenes_json,
+                    "Status": "Generating"
+                }
+            )
+        
         logger.info(f"🎬 Генерирую {len(scenes)} сцен ПАРАЛЛЕЛЬНО через {model_key}...")
         await generating_msg.edit_text(
             f"🎬 Генерирую видео ПАРАЛЛЕЛЬНО\n"
@@ -894,6 +1323,35 @@ async def start_text_photo_video_generation(message: types.Message, state: FSMCo
         
         if not video_paths:
             raise Exception(f"Не удалось скачать ни одного видео из {len(scene_results)} сцен")
+        
+        # 📊 Логирование URL видео сцен в Airtable
+        scene_videos_list = []
+        for i, result in enumerate(scene_results):
+            if result.get("status") == "success":
+                scene_videos_list.append({
+                    "scene": i + 1,
+                    "url": result.get("video_url", "")
+                })
+        
+        if session_id and scene_videos_list:
+            await session_logger.log_scene_artifacts(
+                session_id=session_id,
+                video_type=video_type,
+                scene_videos=scene_videos_list
+            )
+        
+        if session_id and scene_photos:
+            scene_photos_list = []
+            for i, url in scene_photos.items():
+                scene_photos_list.append({
+                    "scene": i + 1,
+                    "url": url
+                })
+            await session_logger.log_scene_artifacts(
+                session_id=session_id,
+                video_type=video_type,
+                scene_photos=scene_photos_list
+            )
         
         await generating_msg.edit_text(
             "🎬 Объединяю видео с плавными переходами...\n\n"

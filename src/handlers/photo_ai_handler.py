@@ -2,14 +2,22 @@
 import asyncio
 import json
 import logging
+import uuid
+import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 from aiogram import Router, types, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import StateFilter
-from video_generator import VideoGenerator
-from photo_generator import PhotoGenerator
-from video_stitcher import VideoStitcher
+from generators.video_generator import VideoGenerator
+from generators.photo_generator import PhotoGenerator
+from generators.video_stitcher import VideoStitcher
+from integrations.airtable.airtable_logger import session_logger
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -63,7 +71,7 @@ class PhotoAIStates(StatesGroup):
     asking_reference = State()  # Вопрос о референсе
     waiting_reference = State()  # Загрузка референса
     waiting_prompt = State()  # Ввод промта
-    processing_prompt = State()  # GPT обработка промта
+    processing_prompt = State()  # Gemini обработка промта
     confirming_scenes = State()  # Подтверждение сцен
     editing_scene = State()  # Редактирование сцены
     generating_photos = State()  # Генерация фото
@@ -74,7 +82,48 @@ class PhotoAIStates(StatesGroup):
 @router.callback_query(lambda c: c.data == "video_text_photo_ai")
 async def start_text_photo_ai_video(callback: types.CallbackQuery, state: FSMContext):
     """Начало потока Текст + Фото + AI"""
+    from src.workflow_tracker import WorkflowTracker
+    
     await callback.answer()
+    
+    # 🔄 Создание workflow для режима Текст + Фото + AI
+    user_id = callback.from_user.id
+    session_id = f"video_{uuid.uuid4().hex[:12]}"
+    start_time = time.time()
+    
+    tracker = WorkflowTracker()
+    
+    # Определение этапов workflow
+    stages = [
+        {"id": 1, "title": "⚙️ Выбор модели", "description": "Выбор AI модели для генерации"},
+        {"id": 2, "title": "📐 Настройка параметров", "description": "Соотношение сторон, качество"},
+        {"id": 3, "title": "📸 Референс (опционально)", "description": "Загрузка референсного изображения"},
+        {"id": 4, "title": "✍️ Написание промпта", "description": "Описание желаемого видео"},
+        {"id": 5, "title": "🤖 Обработка Gemini", "description": "Разбиение на сцены через AI"},
+        {"id": 6, "title": "🎨 Генерация фото", "description": "Создание фото для каждой сцены через google/nano-banana"},
+        {"id": 7, "title": "✅ Подтверждение сцен", "description": "Проверка сгенерированных фото"},
+        {"id": 8, "title": "🎬 Генерация видео", "description": "Создание видео через Kling на основе фото"},
+        {"id": 9, "title": "🎞️ Склеивание видео", "description": "Объединение всех сцен в одно видео"},
+        {"id": 10, "title": "📤 Отправка результата", "description": "Доставка видео в Telegram"}
+    ]
+    
+    # Запуск workflow
+    workflow_id = tracker.start_workflow(user_id, "📹 Создание видео (Текст + Фото + AI)", stages)
+    
+    # 📊 Логирование в Airtable
+    logger.info(f"🔍 DEBUG: Starting Airtable logging for text_photo_ai workflow with session_id={session_id}")
+    start_result = await session_logger.log_session_start(
+        user_id=user_id,
+        session_id=session_id,
+        video_type="text_photo_ai"
+    )
+    logger.info(f"   Result: {start_result}")
+    
+    await state.update_data(workflow_id=workflow_id, session_id=session_id, start_time=start_time, video_type="text_photo_ai")
+    
+    # Первый этап - выбор модели
+    tracker.update_stage(workflow_id, 1, "running", {"step": "Выбор AI модели"})
+    
     await state.set_state(PhotoAIStates.choosing_model)
     
     keyboard = InlineKeyboardMarkup(
@@ -90,7 +139,9 @@ async def start_text_photo_ai_video(callback: types.CallbackQuery, state: FSMCon
         "1️⃣ Разбивает промт на сцены\n"
         "2️⃣ Генерирует фото для каждой сцены (google/nano-banana)\n"
         "3️⃣ Создает видео на основе фото (Kling v2.5)\n\n"
-        "🎬 Выбери модель видео:",
+        "🎬 Выбери модель видео:\n\n"
+        "📊 <b>Следи за процессом:</b> http://localhost:3000/workflow",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
@@ -136,7 +187,7 @@ async def choose_photo_ai_aspect_ratio(callback: types.CallbackQuery, state: FSM
     }
     
     aspect_ratio = aspect_map.get(callback.data, "16:9")
-    await state.update_data(aspect_ratio=aspect_ratio)
+    await state.update_data(aspect_ratio=aspect_ratio, duration_per_scene=5)
     await state.set_state(PhotoAIStates.asking_reference)
     
     aspect_names = {
@@ -156,11 +207,16 @@ async def choose_photo_ai_aspect_ratio(callback: types.CallbackQuery, state: FSM
     )
     
     await callback.message.answer(
-        f"✅ Соотношение сторон: {aspect_names.get(aspect_ratio, aspect_ratio)}\n"
-        f"{'─' * 40}\n\n"
+        f"✅ Параметры видео:\n"
+        f"{'═' * 40}\n\n"
+        f"🎬 Модель: KLING\n"
+        f"📐 Соотношение: {aspect_names.get(aspect_ratio, aspect_ratio)}\n"
+        f"⏱️  Длительность: <b>5 сек</b>\n\n"
+        f"{'═' * 40}\n"
         f"🎨 Использовать ли референс-изображение?\n\n"
         f"✅ По референсу - загружаешь изображение, AI генерирует фото в похожем стиле\n"
         f"❌ Без референса - AI сама генерирует фото по описанию",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
@@ -247,11 +303,17 @@ async def process_reference_image(message: types.Message, state: FSMContext):
 @router.message(PhotoAIStates.waiting_prompt)
 async def process_prompt(message: types.Message, state: FSMContext):
     """Обработка промта и разбиение на сцены + СРАЗУ ГЕНЕРИРУЕМ ВСЕ ФОТО ПАРАЛЛЕЛЬНО (БЕЗ ПОДТВЕРЖДЕНИЯ СЦЕН)"""
+    from integrations.airtable.airtable_video_update import update_video_parameters
+    
     data = await state.get_data()
     reference_file_id = data.get("reference_file_id")
+    session_id = data.get("session_id")
     
     await state.update_data(prompt=message.text)
     await state.set_state(PhotoAIStates.processing_prompt)
+    
+    if session_id:
+        await update_video_parameters(session_id, prompt=message.text[:500])
     
     input_text = message.text
     indented_input = "\n".join("    " + line for line in input_text.split("\n"))
@@ -260,7 +322,7 @@ async def process_prompt(message: types.Message, state: FSMContext):
     num_scenes = _extract_num_scenes_from_prompt(message.text)
     
     processing_msg = await message.answer(
-        f"⏳ Обработка промта через GPT-4...\n"
+        f"⏳ Обработка промта через Gemini AI...\n"
         f"{'─' * 40}\n\n"
         f"📝 Ваш промт:\n\n{indented_input}\n\n"
         f"{'─' * 40}\n"
@@ -271,8 +333,8 @@ async def process_prompt(message: types.Message, state: FSMContext):
     try:
         generator = VideoGenerator()
         
-        # ✅ GPT разбивает промт на сцены
-        scenes_result = await generator.enhance_prompt_with_gpt(
+        # ✅ Gemini разбивает промт на сцены
+        scenes_result = await generator.enhance_prompt_with_gemini(
             prompt=message.text,
             num_scenes=num_scenes,
             duration_per_scene=5
@@ -284,14 +346,14 @@ async def process_prompt(message: types.Message, state: FSMContext):
         # 🔒 Убеждаемся, что у каждой сцены есть промт (защита от бага)
         for i, scene in enumerate(scenes, 1):
             if not scene.get("prompt"):
-                logger.error(f"❌ КРИТИЧНО: Сцена {i} потеряла промт в GPT обработке!")
+                logger.error(f"❌ КРИТИЧНО: Сцена {i} потеряла промт в Gemini обработке!")
                 # Восстанавливаем хотя бы что-то
                 scene["prompt"] = f"Сцена {i} - часть описания: {message.text[:80]}"
                 logger.warning(f"   ✅ Восстановлен fallback промт: '{scene['prompt'][:50]}'")
         
         # ✅ ТОЛЬКО ПОКАЗЫВАЕМ что идет обработка (БЕЗ дублирования информации)
         await processing_msg.edit_text(
-            f"✅ GPT-4 ОБРАБОТКА ЗАВЕРШЕНА!\n"
+            f"✅ GEMINI ОБРАБОТКА ЗАВЕРШЕНА!\n"
             f"{'═' * 50}\n\n"
             f"📸 Генерирую фото для {len(scenes)} сцен...\n"
             f"⏳ Это займет 1-2 мин (каждое фото наследует от предыдущего)...\n\n"
@@ -550,6 +612,7 @@ async def regenerate_all_photos(callback: types.CallbackQuery, state: FSMContext
     data = await state.get_data()
     scenes = data.get("scenes", [])
     aspect_ratio = data.get("aspect_ratio", "16:9")
+    reference_url = data.get("reference_url")
     
     processing_msg = await callback.message.answer(
         f"🔄 Переделаю фото для всех {len(scenes)} сцен ПОСЛЕДОВАТЕЛЬНО...\n"
@@ -566,7 +629,7 @@ async def regenerate_all_photos(callback: types.CallbackQuery, state: FSMContext
         photos_result = await photo_gen.generate_photos_for_scenes(
             scenes=scenes,
             aspect_ratio=aspect_ratio,
-            reference_image_url=None,
+            reference_image_url=reference_url,
             general_prompt=""
         )
         
@@ -723,7 +786,7 @@ async def regenerate_scenes(callback: types.CallbackQuery, state: FSMContext):
         generator = VideoGenerator()
         num_scenes = _extract_num_scenes_from_prompt(prompt)
         
-        scenes_result = await generator.enhance_prompt_with_gpt(
+        scenes_result = await generator.enhance_prompt_with_gemini(
             prompt=prompt,
             num_scenes=num_scenes,
             duration_per_scene=5
@@ -744,7 +807,7 @@ async def regenerate_scenes(callback: types.CallbackQuery, state: FSMContext):
 
 
 async def start_photo_generation_immediate(message: types.Message, state: FSMContext, status_msg=None):
-    """НОВЫЙ процесс: Генерация фото СРАЗУ после GPT разбиения - ПАРАЛЛЕЛЬНО для всех сцен
+    """НОВЫЙ процесс: Генерация фото СРАЗУ после Gemini разбиения - ПАРАЛЛЕЛЬНО для всех сцен
     
     Показывает фото вместе с информацией о сцене (промт, атмосфера, длительность)
     как с референсом, так и без него
@@ -756,6 +819,34 @@ async def start_photo_generation_immediate(message: types.Message, state: FSMCon
     general_prompt = data.get("enhanced_prompt", "")
     
     await state.set_state(PhotoAIStates.generating_photos)
+    
+    # 📊 Логирование параметров генерации в Airtable
+    session_id = data.get("session_id")
+    video_type = data.get("video_type")
+    prompt = data.get("prompt", "")
+    
+    logger.info(f"🔍 DEBUG photo_ai_handler (photo generation): session_id={session_id}, video_type={video_type}")
+    
+    if session_id:
+        enhanced_prompt = data.get("enhanced_prompt", "")
+        prompt_data = {"enhanced_prompt": enhanced_prompt, "scenes": scenes}
+        scenes_json = json.dumps(prompt_data, ensure_ascii=False, indent=2)[:2000]
+        
+        logger.info(f"📤 Logging to Airtable: {len(scenes)} scenes with enhanced_prompt length={len(enhanced_prompt)}")
+        update_result = await session_logger.log_session_update(
+            session_id=session_id,
+            video_type=video_type,
+            update_fields={
+                "Model": data.get("model", "kling").capitalize(),
+                "Aspect Ratio": aspect_ratio,
+                "PromptAI": scenes_json,
+                "Status": "Generating"
+            }
+        )
+        if not update_result:
+            logger.warning(f"⚠️ Failed to update session {session_id} in Airtable")
+    else:
+        logger.warning(f"⚠️ No session_id in state - Airtable logging skipped")
     
     try:
         photo_gen = PhotoGenerator()
@@ -803,6 +894,24 @@ async def start_photo_generation_immediate(message: types.Message, state: FSMCon
                     pass
             
             logger.info(f"✅ Фото готовы! Успешно: {successful}/{total}")
+            
+            # 📊 Логирование URL фото сцен в Airtable
+            session_id = data.get("session_id")
+            video_type = data.get("video_type")
+            scene_photos_list = []
+            for idx, scene in enumerate(scenes_with_photos):
+                if scene.get("photo_url"):
+                    scene_photos_list.append({
+                        "scene": idx + 1,
+                        "url": scene.get("photo_url", "")
+                    })
+            
+            if session_id and scene_photos_list:
+                await session_logger.log_scene_artifacts(
+                    session_id=session_id,
+                    video_type=video_type,
+                    scene_photos=scene_photos_list
+                )
             
             # ✅ Показываем первое фото с полной информацией
             await show_photo_for_confirmation(message, state, 0)
@@ -1240,6 +1349,38 @@ async def start_video_generation_final(message: types.Message, state: FSMContext
                             "• Kling v2.5 Turbo Pro (видео)"
                 )
                 
+                # 📊 Логирование URL видео сцен в Airtable
+                session_id = data.get("session_id")
+                video_type = data.get("video_type")
+                scenes_with_photos = data.get("scenes_with_photos", [])
+                
+                scene_videos_list = []
+                for idx, scene in enumerate(scenes_with_photos):
+                    if scene.get("video_url"):
+                        scene_videos_list.append({
+                            "scene": idx + 1,
+                            "url": scene.get("video_url", "")
+                        })
+                
+                if session_id and scene_videos_list:
+                    await session_logger.log_scene_artifacts(
+                        session_id=session_id,
+                        video_type=video_type,
+                        scene_videos=scene_videos_list
+                    )
+                
+                # 📊 Логирование завершения в Airtable
+                start_time = data.get("start_time")
+                if session_id and start_time:
+                    processing_time = time.time() - start_time
+                    await session_logger.log_session_complete(
+                        session_id=session_id,
+                        video_type=video_type,
+                        status="Completed",
+                        output_url=final_video,
+                        processing_time=processing_time
+                    )
+                
                 await stitcher.cleanup_temp_files()
                 logger.info("✅ Видео успешно отправлено!")
             else:
@@ -1250,6 +1391,20 @@ async def start_video_generation_final(message: types.Message, state: FSMContext
     except Exception as e:
         logger.error(f"❌ Ошибка генерации видео: {e}")
         await generating_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+        
+        # 📊 Логирование ошибки в Airtable
+        data = await state.get_data()
+        session_id = data.get("session_id")
+        video_type = data.get("video_type")
+        if session_id:
+            await session_logger.log_session_update(
+                session_id=session_id,
+                video_type=video_type,
+                update_fields={
+                    "Status": "Failed",
+                    "Error Message": str(e)[:500]
+                }
+            )
     
     finally:
         await state.clear()

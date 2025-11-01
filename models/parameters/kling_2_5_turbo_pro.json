@@ -23,18 +23,25 @@
       "type": "string",
       "enum": ["16:9", "9:16", "1:1"],
       "default": "16:9",
-      "description": "Aspect ratio of the video"
+      "description": "Aspect ratio of the video. Ignored if start_image is provided."
     },
     "start_image": {
       "type": "string",
       "format": "uri",
       "nullable": true,
-      "description": "First frame of the video (for image-to-video)"
+      "description": "First frame of the video"
     },
     "negative_prompt": {
       "type": "string",
       "default": "",
       "description": "Things you do not want to see in the video"
+    },
+    "image": {
+      "type": "string",
+      "format": "uri",
+      "nullable": true,
+      "deprecated": true,
+      "description": "Deprecated: Use start_image instead."
     }
   },
   "default_settings": {

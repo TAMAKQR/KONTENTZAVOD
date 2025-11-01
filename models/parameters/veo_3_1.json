@@ -1,4 +1,16 @@
 {
+  "model": "google/veo-3.1-fast",
+  "model_name": "Veo 3.1 Fast",
+  "pricing": {
+    "per_second": 0.15,
+    "currency": "USD",
+    "note": "~$0.15 per second of generated video",
+    "examples": {
+      "4_seconds": "$0.60",
+      "6_seconds": "$0.90",
+      "8_seconds": "$1.20"
+    }
+  },
   "type": "object",
   "title": "Input",
   "required": [

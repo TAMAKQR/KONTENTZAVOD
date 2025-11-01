@@ -5,11 +5,15 @@ import logging
 import io
 import base64
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Optional, List
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import aiohttp
 import replicate
-from config import REPLICATE_API_TOKEN
+from src.config import REPLICATE_API_TOKEN
 
 logger = logging.getLogger(__name__)
 
